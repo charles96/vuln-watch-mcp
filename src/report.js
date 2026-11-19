@@ -316,6 +316,7 @@ export function findingToMarkdown(f, { verbose = true } = {}) {
   if (f.malicious) {
     L.push(`- 🚨 This package version is flagged as MALICIOUS. Remove it immediately, check whether install scripts ran (CI and dev machines), and rotate any credentials/tokens available in those environments.`);
   }
+  if (f.suppressionOverridden) L.push(`- ⚠️ Suppressed in .vulnwatch.json ("${f.suppressionOverridden.reason}") but still shown: ${f.suppressionOverridden.why}. Confirm with the user before ignoring it.`);
   L.push(`- Summary: ${f.description.length > 900 ? f.description.slice(0, 900) + "… (truncated; see advisory)" : f.description}`);
   if (f.nvdDescription && verbose && f.nvdDescription.length < 600) L.push(`- NVD description: ${f.nvdDescription}`);
   if (f.cvss) L.push(`- ${f.cvss}`);

@@ -98,6 +98,7 @@ NVD 키가 있으면 아래가 달라집니다. [여기서 신청](https://nvd.n
 - "최근 2주간 나온 Python 심각 취약점 알려줘"
 - "CVE-2021-44228, 우리 log4j-core 2.14.1에서 어떻게 고쳐?"
 - "GHSA-35jh-r3h4-6jhm 뭐야?"
+- "lodash 취약점은 template 안 쓰니까 오탐 처리해 줘"
 - Claude Code에서 `/mcp__vuln-watch__security_audit`: 스캔 → 최신 취약점 확인 → 수정 → 재검증을 한 번에 진행합니다.
 
 ## 지원하는 언어와 의존성 파일
@@ -160,13 +161,16 @@ Maven이나 Gradle을 실행하지 않고 Maven Central과 Google Maven의 POM�
 | 특정 취약점 조사 | [`get_vulnerability`](#get_vulnerability) | CVE/GHSA/PYSEC 등 ID 하나의 전체 정보와 패키지별 수정 버전 |
 | 실제 악용 여부 | [`check_kev`](#check_kev) | CVE 목록의 KEV 등재 여부 + EPSS |
 | | [`search_kev`](#search_kev) | KEV 카탈로그 검색 |
+| 오탐 관리 | [`ignore_vulnerability`](#ignore_vulnerability) | 오탐/수용한 위험을 `.vulnwatch.json`에 기록해 다음 스캔부터 제외 |
+| | [`list_ignored`](#list_ignored) | 예외 목록과 상태(활성/만료 임박/만료) 조회 |
+| | [`remove_ignore`](#remove_ignore) | 예외 삭제 |
 
 공통 사항:
 - **우선순위:** 🚨 악성 패키지 → 🔥 KEV(실제 악용) → ⚠️ EPSS 10% 이상 → CRITICAL/HIGH → 최신순
 - **심각도 값:** `min_severity`에는 `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`을 넣습니다.
 - **생태계 값:** `ecosystem`에는 `npm`(`javascript`, `typescript`, `node`), `pypi`(`python`), `go`, `maven`(`java`, `kotlin`, `gradle`), `nuget`(`dotnet`, `csharp`, `c#`, `fsharp`), `composer`(`php`), `rubygems`(`ruby`), `cargo`(`rust`), `pub`(`dart`, `flutter`), `hex`(`elixir`, `erlang`), `swift`, `cran`(`r`)을 쓸 수 있습니다. 괄호 안은 같은 뜻으로 받는 별칭입니다.
 - **데이터 소스 선택:** `sources`에는 `auto`(기본: OSV, 키가 있으면 NVD 교차 확인 추가), `osv`, `nvd`, `both`를 쓸 수 있습니다.
-- **결과 형식:** `check_kev`를 뺀 모든 도구는 `format: "json"`으로 구조화된 결과를 받을 수 있습니다 (기본값 `markdown`).
+- **결과 형식:** 조회 도구는 `format: "json"`으로 구조화된 결과를 받을 수 있습니다 (기본값 `markdown`, `check_kev`와 오탐 관리 도구 제외).
 
 ### `scan_project_dependencies`
 
@@ -191,6 +195,9 @@ Maven이나 Gradle을 실행하지 않고 Maven Central과 Google Maven의 POM�
 | `check_health` | | `true` | 직접 의존성의 deprecated/yank/유지보수 중단 확인 |
 | `min_severity` | | | 이 심각도 미만 숨김 (악성·KEV는 항상 표시) |
 | `detailed_findings` | | `15` | 자세히 보여 줄 상위 결과 수 (조치 계획은 항상 전체) |
+| `estimated_versions` | | `flag` | 범위에서 추정한 버전의 결과: `flag`(경고와 함께 표시) / `hide`(개수만 표시). KEV·악성은 항상 표시 |
+| `include_low_confidence` | | `false` | NVD 이름 추측으로만 찾은 결과(`Match confidence: medium`) 표시 여부 |
+| `apply_ignore_file` | | `true` | `.vulnwatch.json`의 예외와 `ignorePaths` 적용 |
 
 ```json
 { "path": "/home/me/my-app", "recursive": true, "min_severity": "HIGH" }
@@ -212,6 +219,7 @@ Maven이나 Gradle을 실행하지 않고 Maven Central과 Google Maven의 POM�
 | `vendor` | | | NVD 결과를 좁힐 CPE 벤더 이름. 예: `djangoproject`, `f5`, `openssl` |
 | `sources` | | `auto` | 데이터 소스 선택 |
 | `min_severity` | | | 이 심각도 미만 숨김 |
+| `project_path` | | | 이 프로젝트의 `.vulnwatch.json` 예외 적용 |
 
 ```json
 { "name": "axios", "ecosystem": "npm" }
@@ -303,6 +311,37 @@ KEV 카탈로그를 직접 검색합니다(최근 추가순). "최근 한 달간
 { "days": 30, "ransomware_only": true }
 ```
 
+### `ignore_vulnerability`
+
+오탐이나 위험을 수용하기로 한 결과를 프로젝트의 `.vulnwatch.json`에 기록해, 다음 스캔부터 제외합니다. 에이전트는 **코드에서 해당되지 않음을 확인한 뒤**(취약한 함수 미사용, 빌드·테스트 전용, 해당 플랫폼 미사용 등) 구체적인 사유와 함께 호출해야 합니다.
+
+- 사유(`reason`)는 필수이고, 만료일 기본값은 **90일 뒤**입니다(재검토 유도).
+- `version`을 지정하면 그 버전에서만 제외되고, 버전이 바뀌면 다시 보고됩니다.
+- **악성 패키지와 CISA KEV는 등록을 거부합니다.** 사용자가 명시적으로 승인한 경우에만 `allow_high_risk: true`로 등록할 수 있습니다.
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `path` | ✅ | | 프로젝트 루트 (상위 폴더에 `.vulnwatch.json`이 있으면 그 파일 사용) |
+| `id` | | | 권고 ID (CVE/GHSA/PYSEC 등, 별칭도 매칭). 생략하면 `package`의 모든 결과 제외 |
+| `package` | | | 패키지 이름 (권장) |
+| `version` | | | 이 버전에서만 제외 |
+| `ecosystem` | | | 생태계 |
+| `reason` | ✅ | | 구체적인 사유 (10자 이상) |
+| `expires` | | 90일 뒤 | 재검토 날짜 `YYYY-MM-DD` 또는 `never` |
+| `allow_high_risk` | | `false` | 악성/KEV 결과 제외 허용 (사용자 승인 필요) |
+
+```json
+{ "path": "/home/me/my-app", "id": "CVE-2021-23337", "package": "lodash", "reason": "_.template을 쓰지 않음 (src/** 검색으로 확인)" }
+```
+
+### `list_ignored`
+
+프로젝트의 `.vulnwatch.json`에 있는 예외와 `ignorePaths`를 상태(활성 / 14일 내 만료 / 만료 / 형식 오류)와 함께 보여 줍니다. 파라미터는 `path` 하나입니다.
+
+### `remove_ignore`
+
+예외를 삭제합니다. 패키지를 업그레이드했거나, 오탐이 아니었던 것으로 밝혀졌을 때 씁니다. `path`와 함께 `id`, `package`, `version` 중 하나 이상으로 대상을 고릅니다.
+
 ### 프롬프트: `security_audit`
 
 도구를 하나씩 부르는 대신 **점검부터 수정까지 한 번에** 진행하도록 에이전트에게 주는 작업 지시입니다. `path`(선택, 기본값은 현재 폴더)를 받습니다.
@@ -313,7 +352,47 @@ KEV 카탈로그를 직접 검색합니다(최근 추가순). "최근 한 달간
    - 의존성 파일과 lockfile을 업데이트하고, 간접 의존성은 overrides/resolutions로 고정합니다.
    - 코드에서 취약한 기능을 쓰는 곳을 찾아 CWE 가이드대로 수정합니다.
    - deprecated나 유지보수가 중단된 패키지는 교체합니다.
-4. 다시 스캔해서 확인하고, 고친 것·남은 것·권장 완화 조치를 요약
+4. 해당되지 않는 결과는 코드에서 확인한 뒤 `ignore_vulnerability`로 사유와 함께 기록 (악성·KEV는 사용자 확인 필수)
+5. 다시 스캔해서 확인하고, 고친 것·예외 처리한 것(사유)·남은 것·권장 완화 조치를 요약
+
+## 오탐 줄이기
+
+오탐은 세 단계로 처리합니다.
+
+**1. 자동으로 줄이기 (설정 불필요)**
+- **정확한 버전 우선:** lockfile이 없으면 설치된 `node_modules`의 실제 버전을 쓰고, 범위에서 추정한 버전은 "추정"으로 표시합니다. `estimated_versions: "hide"`로 숨길 수도 있습니다.
+- **이름 추측 매칭 숨김:** NVD 이름 추측으로만 찾은 결과(`Match confidence: medium`)는 기본으로 숨기고 개수만 알려 줍니다.
+- **중복 보고 방지:** 상위 폴더 lockfile이 다루는 모노레포 하위 `package.json`은 중복 보고하지 않습니다.
+
+**2. 프로젝트별 예외 목록 (`.vulnwatch.json`)**
+
+스캔 경로에서 상위로 올라가며(최대 git 루트까지) 가장 가까운 파일을 씁니다. git에 커밋해 팀이 같은 기준을 공유하세요.
+
+```json
+{
+  "ignorePaths": ["examples/**", "test/fixtures/**"],
+  "ignore": [
+    { "id": "CVE-2021-23337", "package": "lodash", "reason": "_.template 미사용", "expires": "2027-03-01" },
+    { "package": "webpack-dev-server", "reason": "로컬 개발 서버 전용, 배포물에 포함 안 됨", "expires": "2027-01-01" },
+    { "id": "GHSA-xxxx-xxxx-xxxx", "package": "foo", "version": "1.2.3", "reason": "해당 플랫폼(Windows) 미사용" }
+  ]
+}
+```
+
+| 필드 | 설명 |
+|---|---|
+| `ignorePaths` | 이 경로(glob)의 의존성 파일은 스캔하지 않습니다. 의도적으로 취약한 테스트용 샘플 등에 씁니다. |
+| `ignore[].id` | CVE/GHSA/PYSEC 등. 별칭도 매칭됩니다. 생략하면 `package`의 모든 결과를 제외합니다. |
+| `ignore[].package` / `version` / `ecosystem` | 범위를 좁힙니다. `version`을 주면 버전이 바뀌는 순간 다시 보고됩니다. |
+| `ignore[].reason` | **필수.** 없으면 형식 오류로 보고되고 적용되지 않습니다. |
+| `ignore[].expires` | 만료일. 지나면 다시 보고되고 "만료된 예외"로 표시됩니다. |
+| `ignore[].allowHighRisk` | `true`일 때만 악성·KEV 결과를 숨깁니다. 없으면 예외로 등록돼 있어도 경고와 함께 계속 표시합니다. |
+
+스캔 결과에는 예외 처리된 목록(사유 포함), 만료된 예외, **아무것도 매칭하지 않은 예외**(이미 고쳐졌을 가능성, 정리 대상)가 함께 나옵니다.
+
+**3. 에이전트가 직접 기록 (`ignore_vulnerability`)**
+
+에이전트가 코드를 확인해 해당되지 않는다고 판단하면, 사유를 적어 위 파일에 기록합니다. 다음 스캔부터 같은 오탐을 반복 보고하지 않습니다. 악성·KEV는 사용자 승인 없이 등록할 수 없습니다.
 
 ## 결과에 포함되는 정보
 
@@ -339,7 +418,7 @@ KEV 카탈로그를 직접 검색합니다(최근 추가순). "최근 한 달간
 ```
 vuln-watch-mcp/
 ├── src/
-│   ├── index.js         # MCP 서버 진입점: 도구 7개, security_audit 프롬프트, 서버 안내문
+│   ├── index.js         # MCP 서버 진입점: 도구 10개, security_audit 프롬프트, 서버 안내문
 │   ├── scan.js          # 분석 파이프라인: OSV+NVD 병합, KEV/EPSS 부착, 조치 계획, 목표 버전 검증, 패키지 상태
 │   ├── deps.js          # 의존성 파일 파서 (12개 생태계, 35종 이상 파일), 하위 폴더 탐색, 버전 출처 표시
 │   ├── maven.js         # Maven 해석기: 부모 POM, 속성 치환, BOM, 간접 의존성 (Maven Central / Google Maven)
@@ -350,6 +429,7 @@ vuln-watch-mcp/
 │   ├── epss.js          # FIRST EPSS 일괄 조회
 │   ├── registry.js      # 11개 패키지 레지스트리 조회 (최신 버전, deprecated, yank/retire, 배포일)
 │   ├── report.js        # 결과 생성: 수정 버전 계산, 업그레이드 명령, 정렬, Markdown 출력
+│   ├── ignore.js        # 오탐 관리: .vulnwatch.json 탐색·적용·편집, ignorePaths
 │   ├── cvss.js          # CVSS 3.x 벡터로 점수 계산 (OSV는 벡터만 제공)
 │   ├── ecosystems.js    # 언어별 설정 (CPE 플랫폼, 검색 키워드, 업그레이드 명령 템플릿)
 │   ├── remediation.js   # CWE별 코드 수정 가이드

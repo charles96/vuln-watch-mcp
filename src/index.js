@@ -13,6 +13,9 @@ import { analyzeDependencies, actionPlan, enrichPlan, healthIssues, planToMarkdo
 import { getEpss } from "./epss.js";
 import { getOsvVuln, OSV_ECOSYSTEM } from "./osv.js";
 import { getRegistryInfo } from "./registry.js";
+import { loadIgnoreConfig, applyIgnores, pathIgnored, addIgnoreEntry, removeIgnoreEntries, describeEntry, entryStatus, findIgnoreFile, readIgnoreFile, today, IGNORE_FILE } from "./ignore.js";
+import { stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 const VERSION = "0.2.0";
 const NVD_MAX_RANGE_DAYS = 120;
@@ -31,6 +34,7 @@ Use it to find AND FIX vulnerabilities while coding:
 - Before adding/upgrading a dependency → check_package (version optional = latest). It also flags malicious, deprecated and unmaintained packages.
 - When asked about project security, or after changing manifests/lockfiles → scan_project_dependencies (path = project root, recursive=true for monorepos). Supports JS/TS, Python, Go (incl. stdlib), Rust, PHP, Ruby, Java/Kotlin (Maven parent POM/BOM, Gradle version catalogs, transitive resolution), C#/.NET, Dart/Flutter, Elixir, Swift and R.
 - Findings whose version was estimated from a range (no lockfile) can be false positives: say so and recommend adding a lockfile.
+- False positives: when a finding verifiably does not apply (vulnerable API unused, dev/test-only, other platform), record it with ignore_vulnerability (concrete reason, expiry) so it is not reported again; list_ignored / remove_ignore manage them. Never suppress malicious or CISA KEV findings without the user's explicit approval.
 - To learn what is newly vulnerable in the project's language → latest_ecosystem_vulnerabilities.
 - When a CVE/GHSA/PYSEC/GO/RUSTSEC ID appears (logs, audit output, advisories) → get_vulnerability.
 Priority: 🚨 malicious package → 🔥 CISA KEV → high EPSS → CRITICAL/HIGH.
@@ -87,8 +91,47 @@ function summaryLine(findings, plan) {
   return `Vulnerable packages: ${plan.length} · Findings: ${findings.length} (MALICIOUS: ${c((f) => f.malicious)}, KEV: ${c((f) => f.kev)}, EPSS≥10%: ${c((f) => (f.epss?.probability || 0) >= 0.1)}, CRITICAL: ${c((f) => f.severity === "CRITICAL")}, HIGH: ${c((f) => f.severity === "HIGH")})`;
 }
 
+function fpSummaryLine(cfg, ign, hidden, skippedPaths) {
+  const parts = [];
+  if (cfg) parts.push(`${IGNORE_FILE}: ${ign.suppressed.length} suppressed${ign.highRiskKept.length ? `, ${ign.highRiskKept.length} kept despite suppression (KEV/malicious)` : ""}${ign.expired.length ? `, ${ign.expired.length} expired entr${ign.expired.length === 1 ? "y" : "ies"}` : ""}`);
+  if (skippedPaths.size) parts.push(`ignorePaths skipped ${skippedPaths.size} manifest(s)`);
+  if (hidden.lowConfidence) parts.push(`${hidden.lowConfidence} low-confidence NVD name match(es) hidden (include_low_confidence=true to show)`);
+  if (hidden.estimated) parts.push(`${hidden.estimated} finding(s) on estimated versions hidden`);
+  return parts.length ? `False-positive controls: ${parts.join(" · ")}` : "";
+}
+
+function fpSummaryJson(cfg, ign, hidden, skippedPaths) {
+  return {
+    ignoreFile: cfg?.file || null,
+    suppressed: ign.suppressed.map(({ finding, entry }) => ({ id: finding.id, package: finding.package && `${finding.package.name}@${finding.package.version}`, reason: entry.reason, expires: entry.expires || null })),
+    keptDespiteSuppression: ign.highRiskKept.map(({ finding, entry }) => ({ id: finding.id, reason: entry.reason, why: finding.suppressionOverridden?.why })),
+    expiredEntries: ign.expired,
+    invalidEntries: ign.invalid,
+    unusedEntries: ign.unused,
+    skippedManifests: Object.fromEntries(skippedPaths),
+    hidden,
+  };
+}
+
+function suppressedToMarkdown(cfg, ign, complete) {
+  if (!cfg) return "";
+  const L = [];
+  if (ign.suppressed.length) {
+    L.push(`## Suppressed by ${cfg.file} (${ign.suppressed.length})`);
+    for (const { finding: f, entry: e } of ign.suppressed.slice(0, 60)) L.push(`- ${f.id}${f.package ? ` — ${f.package.name}@${f.package.version}` : ""} (${f.severity}) — "${e.reason}"${e.expires ? `, expires ${e.expires}` : ""}`);
+    if (ign.suppressed.length > 60) L.push(`- …and ${ign.suppressed.length - 60} more`);
+  }
+  if (ign.highRiskKept.length) {
+    L.push(`\n⚠️ ${ign.highRiskKept.length} suppressed finding(s) are still shown because they are malicious or actively exploited (CISA KEV). Re-verify them with the user; to hide them anyway the entry needs "allowHighRisk": true.`);
+  }
+  if (ign.expired.length) L.push(`\nExpired suppressions (now reported again — re-verify and renew or remove):\n${ign.expired.map((e) => `- ${describeEntry(e)}`).join("\n")}`);
+  if (ign.invalid.length) L.push(`\nInvalid entries (need "reason" and "id" or "package"):\n${ign.invalid.map((e) => `- ${JSON.stringify(e)}`).join("\n")}`);
+  if (complete && ign.unused.length) L.push(`\nUnused suppressions (matched nothing in this scan — likely fixed; consider removing with remove_ignore):\n${ign.unused.map((e) => `- ${describeEntry(e)}`).join("\n")}`);
+  return L.join("\n");
+}
+
 const NEXT_STEPS =
-  "---\nNext steps: remove malicious packages first, then update manifests + lockfiles to the target versions (prefer the version marked as having no known advisories), search the codebase for usages of the vulnerable APIs described above and apply the code-fix guidance, then re-run the scan to verify.";
+  "---\nIf a finding does not apply to this project (vulnerable function not used, dev-only tooling, platform not used), verify it in the code and record it with ignore_vulnerability (with a concrete reason) instead of repeating it.\nNext steps: remove malicious packages first, then update manifests + lockfiles to the target versions (prefer the version marked as having no known advisories), search the codebase for usages of the vulnerable APIs described above and apply the code-fix guidance, then re-run the scan to verify.";
 
 // ---------- tools ----------
 
@@ -109,6 +152,9 @@ server.registerTool(
       check_health: z.boolean().default(true).describe("Report deprecated / yanked / unmaintained direct dependencies via package registries"),
       min_severity: SEVERITY.optional().describe("Hide findings below this severity (malicious and KEV findings are always shown)"),
       detailed_findings: z.number().int().min(0).max(500).default(15).describe("How many top-priority findings to show in full detail (the rest are one-line summaries). The action plan always covers every package."),
+      estimated_versions: z.enum(["flag", "hide"]).default("flag").describe("Findings for versions estimated from a range (no lockfile): flag = show with a false-positive warning, hide = leave them out (count only)"),
+      include_low_confidence: z.boolean().default(false).describe("Include NVD-only matches based on a guessed CPE product name (match confidence: medium). Hidden by default to avoid false positives."),
+      apply_ignore_file: z.boolean().default(true).describe(`Apply suppressions and ignorePaths from the nearest ${".vulnwatch.json"}`),
       format: FORMAT,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -120,6 +166,18 @@ server.registerTool(
       await progress("reading manifests / resolving Maven & Gradle graphs");
       let { deps, manifests, notes } = await collectDependencies(target, { includeDev: args.include_dev, recursive: args.recursive, transitive: args.include_transitive });
       if (!args.include_transitive) deps = deps.filter((d) => d.direct !== false);
+      // false-positive controls: ignorePaths from .vulnwatch.json
+      const ignoreCfg = args.apply_ignore_file ? await loadIgnoreConfig(target) : null;
+      const scanRoot = (await stat(target)).isDirectory() ? target : dirname(target);
+      const skippedPaths = new Map();
+      if (ignoreCfg?.ignorePaths?.length) {
+        deps = deps.filter((d) => {
+          const hit = pathIgnored(ignoreCfg, join(scanRoot, d.source || ""));
+          if (hit) skippedPaths.set(d.source, hit);
+          return !hit;
+        });
+        manifests = manifests.map((m) => (skippedPaths.has(m.replace(/ \(.*\)$/, "")) ? `${m.replace(/ \(.*\)$/, "")} (skipped: ignorePaths "${skippedPaths.get(m.replace(/ \(.*\)$/, ""))}")` : m));
+      }
       deps.sort((a, b) => (a.direct === false) - (b.direct === false) || a.name.localeCompare(b.name));
       if (!deps.length)
         return text(`No dependencies with resolvable versions found in ${target}.${manifests.length ? ` Manifests seen: ${manifests.join(", ")}` : ""}\nSupported: package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, package.json(+node_modules), poetry.lock, uv.lock, pdm.lock, pylock.toml, Pipfile.lock, requirements*.txt, pyproject.toml, go.mod, Cargo.lock/Cargo.toml, composer.lock/composer.json, Gemfile.lock/Gemfile, pom.xml, build.gradle(.kts), gradle/libs.versions.toml, gradle.lockfile, packages.lock.json, obj/project.assets.json, *.csproj, Directory.Packages.props, packages.config, pubspec.lock, mix.lock, Package.resolved, renv.lock. Try recursive=true for monorepos.${notes?.length ? `\nNotes: ${notes.join("; ")}` : ""}`);
@@ -129,7 +187,18 @@ server.registerTool(
       const max = args.max_packages ?? (hasApiKey() ? 60 : 10);
       const nvdDeps = useNvd ? deps.slice(args.offset, args.offset + max) : [];
 
-      const { findings, errors } = await analyzeDependencies(deps, { useOsv, nvdDeps, minSeverity: args.min_severity, onProgress: progress });
+      const analysis = await analyzeDependencies(deps, { useOsv, nvdDeps, minSeverity: args.min_severity, onProgress: progress });
+      const { errors } = analysis;
+      let findings = analysis.findings;
+      // false-positive controls
+      const hidden = { lowConfidence: 0, estimated: 0 };
+      findings = findings.filter((f) => {
+        if (!args.include_low_confidence && f.package?.confidence === "medium" && f.sources.length === 1 && f.sources[0] === "NVD" && !f.kev && !f.malicious) return hidden.lowConfidence++, false;
+        if (args.estimated_versions === "hide" && f.package?.versionSource === "range" && !f.kev && !f.malicious) return hidden.estimated++, false;
+        return true;
+      });
+      const ign = applyIgnores(findings, ignoreCfg);
+      findings = ign.kept;
       await progress("registry lookups");
       const plan = await enrichPlan(actionPlan(findings));
       const health = args.check_health ? await healthIssues(deps, new Set(plan.map((p) => `${p.ecosystem}:${p.name}@${p.version}`))) : [];
@@ -141,7 +210,7 @@ server.registerTool(
         nvd: useNvd ? `packages ${args.offset + 1}–${args.offset + nvdDeps.length} of ${deps.length}` : "skipped (set NVD_API_KEY or sources='both' to cross-check NVD CPE data)",
       };
       if (args.format === "json") {
-        return text(JSON.stringify({ path: target, manifests, notes, ecosystems, totalDependencies: deps.length, coverage, nextOffset, actionPlan: plan, packageHealth: health, findings, errors }, null, 2));
+        return text(JSON.stringify({ path: target, manifests, notes, ecosystems, totalDependencies: deps.length, coverage, nextOffset, falsePositiveControls: fpSummaryJson(ignoreCfg, ign, hidden, skippedPaths), actionPlan: plan, packageHealth: health, findings, errors }, null, 2));
       }
       const head = [
         `# Dependency vulnerability scan: ${target}`,
@@ -155,12 +224,13 @@ server.registerTool(
         notes.length ? `Notes:\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
         `Coverage: OSV ${coverage.osv} · NVD ${coverage.nvd}`,
         summaryLine(findings, plan),
+        fpSummaryLine(ignoreCfg, ign, hidden, skippedPaths),
         nextOffset != null ? `\n⚠️ NVD cross-check not finished → call again with offset=${nextOffset}.` : "",
         errors.length ? `\nErrors: ${errors.join("; ")}` : "",
         useNvd ? rateNote() : "",
       ].filter(Boolean).join("\n");
       const body = findingsToMarkdown(findings, { detailed: args.detailed_findings });
-      return text([head, planToMarkdown(plan), healthToMarkdown(health), `## Findings (malicious → KEV → EPSS → HIGH/CRITICAL → newest)\n\n${body}`, NEXT_STEPS].filter(Boolean).join("\n\n"));
+      return text([head, planToMarkdown(plan), healthToMarkdown(health), `## Findings (malicious → KEV → EPSS → HIGH/CRITICAL → newest)\n\n${body}`, suppressedToMarkdown(ignoreCfg, ign, args.offset === 0), NEXT_STEPS].filter(Boolean).join("\n\n"));
     } catch (err) {
       return errorResult(err);
     }
@@ -180,6 +250,7 @@ server.registerTool(
       vendor: z.string().optional().describe("Optional CPE vendor to narrow NVD results, e.g. 'djangoproject', 'f5', 'openssl'"),
       sources: SOURCES,
       min_severity: SEVERITY.optional(),
+      project_path: z.string().optional().describe(`Apply suppressions from this project's ${IGNORE_FILE}`),
       format: FORMAT,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -202,7 +273,11 @@ server.registerTool(
       const dep = { name: args.name, version, ecosystem: eco, direct: true };
       const useOsv = Boolean(eco && OSV_ECOSYSTEM[eco]) && args.sources !== "nvd";
       const useNvd = args.sources === "nvd" || args.sources === "both" || !useOsv || (args.sources === "auto" && hasApiKey());
-      const { findings, errors } = await analyzeDependencies([dep], { useOsv, nvdDeps: useNvd ? [dep] : [], vendor: args.vendor?.toLowerCase(), minSeverity: args.min_severity, onProgress: progressFn(extra) });
+      const analysis = await analyzeDependencies([dep], { useOsv, nvdDeps: useNvd ? [dep] : [], vendor: args.vendor?.toLowerCase(), minSeverity: args.min_severity, onProgress: progressFn(extra) });
+      const { errors } = analysis;
+      const ignoreCfg = args.project_path ? await loadIgnoreConfig(resolve(args.project_path)) : null;
+      const ign = applyIgnores(analysis.findings, ignoreCfg);
+      const findings = ign.kept;
       const plan = await enrichPlan(actionPlan(findings));
       if (eco && version !== reg?.latest) reg = await getRegistryInfo(dep);
       if (args.format === "json") return text(JSON.stringify({ package: dep, registry: reg, sources: { osv: useOsv, nvd: useNvd }, actionPlan: plan, count: findings.length, findings, errors }, null, 2));
@@ -219,7 +294,8 @@ server.registerTool(
       } else if (eco && !(eco === "go" && args.name === "stdlib") && eco !== "swift") {
         L.push(`Registry: package not found in the ${eco} registry — check the name (typosquatting risk if you expected it to exist).`);
       }
-      L.push(findings.length ? summaryLine(findings, plan) : "✅ No known vulnerabilities for this version.");
+      L.push(findings.length ? summaryLine(findings, plan) : ign.suppressed.length ? `✅ No unsuppressed vulnerabilities (${ign.suppressed.length} suppressed by ${ignoreCfg.file}).` : "✅ No known vulnerabilities for this version.");
+      if (findings.length && ign.suppressed.length) L.push(`${ign.suppressed.length} finding(s) suppressed by ${ignoreCfg.file}.`);
       if (useNvd && !hasApiKey()) L.push(rateNote().trim());
       if (!useOsv && !eco) L.push("> Tip: pass ecosystem (npm, pypi, go, maven, ...) for precise package-level matching via OSV.");
       const body = findings.length ? findingsToMarkdown(findings, { detailed: 30 }) : "";
@@ -531,6 +607,128 @@ server.registerTool(
   }
 );
 
+// ---------- false-positive management ----------
+
+async function highRiskInfo(id) {
+  const up = id.toUpperCase();
+  let cve = /^CVE-/.test(up) ? up : null;
+  let malicious = /^MAL-/.test(up);
+  try {
+    const rec = await getOsvVuln(/^CVE-/.test(up) ? up : id);
+    if (rec) {
+      cve ||= [rec.id, ...(rec.aliases || [])].find((x) => /^CVE-/.test(x)) || null;
+      malicious ||= (rec.database_specific?.cwe_ids || []).includes("CWE-506") || /^malicious (code|package)/i.test(rec.summary || "");
+    }
+  } catch {
+    /* best effort */
+  }
+  const kev = cve ? await getKevEntry(cve) : null;
+  return { cve, kev, malicious };
+}
+
+const DATE = z.string().regex(/^(\d{4}-\d{2}-\d{2}|never)$/, "YYYY-MM-DD or 'never'");
+
+server.registerTool(
+  "ignore_vulnerability",
+  {
+    title: "Record a false positive / accepted risk",
+    description: `Suppresses a finding in future scans by writing it to the project's ${IGNORE_FILE} (committed to git so the whole team shares it). Use ONLY after verifying in the code that it does not apply (e.g. the vulnerable function/feature is never used, the package is build/test-only, the affected platform is not used) or when the user explicitly accepts the risk — always give a concrete reason. Suppressions expire (default 90 days) so they get re-reviewed. Malicious packages and CISA KEV (actively exploited) findings are refused unless allow_high_risk=true, which requires the user's explicit approval.`,
+    inputSchema: {
+      path: z.string().describe(`Project root (where ${IGNORE_FILE} lives or will be created; an existing file in a parent directory is reused)`),
+      id: z.string().optional().describe("Advisory id (CVE/GHSA/PYSEC/GO/...). Matches aliases too. Omit to suppress every advisory of `package`."),
+      package: z.string().optional().describe("Package name to scope the suppression to (recommended)"),
+      version: z.string().optional().describe("Only this exact version (the finding re-appears after the version changes)"),
+      ecosystem: ECO_ENUM.optional(),
+      reason: z.string().min(10).describe("Concrete justification, e.g. 'lodash.template is never called (checked src/**)'"),
+      expires: DATE.optional().describe("Re-review date YYYY-MM-DD (default: 90 days from today) or 'never'"),
+      allow_high_risk: z.boolean().default(false).describe("Required to suppress malicious or CISA KEV findings — only with explicit user approval"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async (args) => {
+    try {
+      if (!args.id && !args.package) return errorResult("Provide at least one of id or package.");
+      const eco = args.ecosystem ? resolveEcosystem(args.ecosystem) || args.ecosystem : undefined;
+      if (args.id) {
+        const risk = await highRiskInfo(args.id);
+        if ((risk.kev || risk.malicious) && !args.allow_high_risk) {
+          return errorResult(
+            `${args.id} is ${risk.malicious ? "a MALICIOUS package advisory" : `actively exploited (CISA KEV, added ${risk.kev.dateAdded})`}. Not suppressed. Fix it instead, or — only if the user explicitly accepts this risk — call again with allow_high_risk=true.`
+          );
+        }
+      }
+      const expires = args.expires || new Date(Date.now() + 90 * 86400_000).toISOString().slice(0, 10);
+      const { file, entry, updated } = await addIgnoreEntry(resolve(args.path), {
+        id: args.id,
+        package: args.package,
+        version: args.version,
+        ecosystem: eco,
+        reason: args.reason,
+        expires,
+        allowHighRisk: args.allow_high_risk || undefined,
+      });
+      return text(`${updated ? "Updated" : "Added"} suppression in ${file}:\n- ${describeEntry(entry)}\n\nCommit ${IGNORE_FILE} so the team shares it. It will be reported again after ${entry.expires === "never" ? "— never (consider an expiry date)" : entry.expires}${entry.version ? ` or when ${entry.package || "the package"} is no longer ${entry.version}` : ""}.`);
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+);
+
+server.registerTool(
+  "list_ignored",
+  {
+    title: "List suppressed vulnerabilities",
+    description: `Shows the suppressions and ignorePaths in the project's ${IGNORE_FILE}, with status (active / expiring soon / expired / invalid).`,
+    inputSchema: { path: z.string().describe("Project root or any path inside it") },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  async ({ path }) => {
+    try {
+      const file = await findIgnoreFile(resolve(path));
+      if (!file) return text(`No ${IGNORE_FILE} found for ${resolve(path)} (searched upwards to the git root). Use ignore_vulnerability to create one.`);
+      const cfg = await readIgnoreFile(file);
+      const soon = new Date(Date.now() + 14 * 86400_000).toISOString().slice(0, 10);
+      const L = [`# ${file}`, `${cfg.ignore.length} suppression(s), ${cfg.ignorePaths.length} ignored path pattern(s)`, ""];
+      for (const e of cfg.ignore) {
+        let st = entryStatus(e);
+        if (st === "active" && e.expires && e.expires !== "never" && e.expires <= soon) st = "expiring soon";
+        if (st === "active" && (!e.expires || e.expires === "never")) st = "active (no expiry)";
+        L.push(`- [${st}] ${describeEntry(e)}${e.added ? ` · added ${e.added}` : ""}`);
+      }
+      if (cfg.ignorePaths.length) L.push("", "Ignored paths (manifests under these are not scanned):", ...cfg.ignorePaths.map((p) => `- ${p}`));
+      return text(L.join("\n"));
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+);
+
+server.registerTool(
+  "remove_ignore",
+  {
+    title: "Remove a suppression",
+    description: `Removes suppression entries from ${IGNORE_FILE} (e.g. when the package was upgraded, or the finding turned out to be relevant).`,
+    inputSchema: {
+      path: z.string().describe("Project root or any path inside it"),
+      id: z.string().optional(),
+      package: z.string().optional(),
+      version: z.string().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  async (args) => {
+    try {
+      if (!args.id && !args.package) return errorResult("Provide id and/or package to select the entries to remove.");
+      const { file, removed } = await removeIgnoreEntries(resolve(args.path), args);
+      if (!file) return text(`No ${IGNORE_FILE} found.`);
+      if (!removed.length) return text(`No matching suppression in ${file}.`);
+      return text(`Removed ${removed.length} suppression(s) from ${file}:\n${removed.map((e) => `- ${describeEntry(e)}`).join("\n")}`);
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+);
+
 // ---------- prompt ----------
 
 server.registerPrompt(
@@ -550,7 +748,8 @@ server.registerPrompt(
 1. Call scan_project_dependencies with recursive=true (continue with offset if it says the NVD cross-check is not finished).
 2. Call latest_ecosystem_vulnerabilities for each detected ecosystem (days=30) to catch brand-new issues.
 3. Fix in priority order: MALICIOUS packages (remove) → CISA KEV → high EPSS → CRITICAL → HIGH; also replace deprecated/unmaintained packages from the package health section. For each: update the manifest and lockfile to the fixed version (use overrides/resolutions for transitive deps), and grep the codebase for usage of the vulnerable feature, applying the CWE code-fix guidance.
-4. Re-run the scan to verify, then summarize what was fixed, what remains (no fix available) and recommended mitigations.`,
+4. For findings that verifiably do not apply (vulnerable function/feature unused, dev/test-only, other platform, version estimated from a range but the installed version is fixed), record them with ignore_vulnerability using a concrete reason. Never suppress malicious or CISA KEV findings without asking the user.
+5. Re-run the scan to verify, then summarize what was fixed, what was suppressed (and why), what remains (no fix available) and recommended mitigations.`,
         },
       },
     ],
