@@ -5,26 +5,35 @@ import { resolve } from "node:path";
 import { z } from "zod";
 
 import { loadKev, getKevEntry, searchKev } from "./kev.js";
-import { getCve, hasApiKey, nvdQueryAll, nvdQueryLatest, severityRank, affectedRanges, compareVersions } from "./nvd.js";
-import { buildFinding, findingToMarkdown, sortFindings } from "./report.js";
-import { collectDependencies, cpeProductCandidates } from "./deps.js";
+import { getCve, hasApiKey, nvdQueryLatest, severityRank, affectedRanges } from "./nvd.js";
+import { buildFinding, buildOsvFinding, findingToMarkdown, sortFindings, attachEpss } from "./report.js";
+import { collectDependencies } from "./deps.js";
 import { ECOSYSTEMS, resolveEcosystem, targetSwRelevance } from "./ecosystems.js";
+import { analyzeDependencies, actionPlan, enrichPlan, healthIssues, planToMarkdown, healthToMarkdown, findingsToMarkdown } from "./scan.js";
+import { getEpss } from "./epss.js";
+import { getOsvVuln, OSV_ECOSYSTEM } from "./osv.js";
+import { getRegistryInfo } from "./registry.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const NVD_MAX_RANGE_DAYS = 120;
 const ECO_ENUM = z
   .string()
   .describe("Language/ecosystem: npm|javascript|typescript, pypi|python, go, maven|java, composer|php, rubygems|ruby, cargo|rust, nuget|dotnet");
 const SEVERITY = z.enum(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
 const FORMAT = z.enum(["markdown", "json"]).default("markdown").describe("markdown for reading, json for structured processing");
+const SOURCES = z
+  .enum(["auto", "osv", "nvd", "both"])
+  .default("auto")
+  .describe("auto = OSV for every package (+ NVD CPE cross-check when NVD_API_KEY is set); osv = fast package-native only; nvd = NVD CPE matching only; both = OSV + NVD");
 
-const INSTRUCTIONS = `vuln-watch: security vulnerability intelligence from CISA KEV (actively exploited) and NVD (CVE details).
+const INSTRUCTIONS = `vuln-watch: security vulnerability intelligence from OSV.dev (package advisories incl. GitHub Advisory DB and malicious packages), NVD (CVE details), CISA KEV (actively exploited) and FIRST EPSS (exploit probability), plus package registry metadata.
 Use it to find AND FIX vulnerabilities while coding:
-- Before adding/upgrading a dependency, or when asked about project security → scan_project_dependencies (path = project root) or check_package.
+- Before adding/upgrading a dependency → check_package (version optional = latest). It also flags malicious, deprecated and unmaintained packages.
+- When asked about project security, or after changing manifests/lockfiles → scan_project_dependencies (path = project root, recursive=true for monorepos).
 - To learn what is newly vulnerable in the project's language → latest_ecosystem_vulnerabilities.
-- When a CVE ID appears (logs, audit output, advisories) → get_vulnerability.
-- KEV entries are being exploited in the wild: fix them first.
-Every finding contains the fixed version, an upgrade command, affected version ranges, CWE-specific code-fix guidance, KEV required action/due date and patch/advisory links.
+- When a CVE/GHSA/PYSEC/GO/RUSTSEC ID appears (logs, audit output, advisories) → get_vulnerability.
+Priority: 🚨 malicious package → 🔥 CISA KEV → high EPSS → CRITICAL/HIGH.
+Every finding contains the fixed version, an upgrade command, affected ranges, CWE-specific code-fix guidance, KEV required action and patch/advisory links; the action plan says whether the target/latest version is clean.
 After finding issues: apply the upgrade (edit manifest + lockfile), apply code fixes for the CWE where the vulnerable API is used in this codebase, then re-run the scan to verify.`;
 
 const server = new McpServer({ name: "vuln-watch", version: VERSION }, { instructions: INSTRUCTIONS });
@@ -47,82 +56,23 @@ function minSeverityFilter(min) {
   return (f) => severityRank(f.severity) >= r;
 }
 
-async function progress(extra, done, total, message) {
+function progressFn(extra) {
   const token = extra?._meta?.progressToken;
-  if (token === undefined) return;
-  try {
-    await extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: done, total, message } });
-  } catch {
-    /* ignore */
-  }
+  let step = 0;
+  return async (message, done, total) => {
+    if (token === undefined) return;
+    try {
+      await extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: done ?? step++, total, message } });
+    } catch {
+      /* ignore */
+    }
+  };
 }
 
 function rateNote() {
   return hasApiKey()
     ? ""
-    : "\n> Note: NVD_API_KEY is not set, so NVD is limited to 5 requests/30s. Get a free key at https://nvd.nist.gov/developers/request-an-api-key and set NVD_API_KEY for ~10x faster scans.";
-}
-
-/** Look up CVEs affecting a specific package version via NVD CPE matching + KEV. */
-async function findingsForPackage(dep, { vendor } = {}) {
-  const eco = dep.ecosystem;
-  const products = cpeProductCandidates(dep);
-  const byId = new Map();
-  for (const product of products) {
-    const match = `cpe:2.3:a:${vendor || "*"}:${product}:${dep.version}`;
-    const { cves } = await nvdQueryAll({ virtualMatchString: match, noRejected: true }, 300);
-    for (const cve of cves) {
-      if (byId.has(cve.id)) continue;
-      const ranges = affectedRanges(cve).filter((r) => r.product?.toLowerCase() === product);
-      const rel = ranges.length ? Math.max(...ranges.map((r) => targetSwRelevance(r.targetSw, eco))) : 1;
-      if (rel === 0) continue; // same product name, different platform (e.g. a WordPress plugin)
-      byId.set(cve.id, { cve, product, confidence: rel === 2 || vendor ? "high" : "medium" });
-    }
-  }
-  const out = [];
-  for (const { cve, product, confidence } of byId.values()) {
-    const kev = await getKevEntry(cve.id);
-    out.push(buildFinding(cve, kev, { ...dep, product, confidence }));
-  }
-  return sortFindings(out);
-}
-
-function actionPlan(findings) {
-  // per package: the highest fixed version needed to clear all its CVEs
-  const plan = new Map();
-  for (const f of findings) {
-    if (!f.package) continue;
-    const key = `${f.package.ecosystem}:${f.package.name}@${f.package.version}`;
-    const p = plan.get(key) || { ...f.package, cves: [], kev: false, worst: "NONE", target: null, unfixed: [] };
-    p.cves.push(f.id);
-    p.kev ||= Boolean(f.kev);
-    if (severityRank(f.severity) > severityRank(p.worst)) p.worst = f.severity;
-    if (f.fixedVersion) {
-      if (!p.target || compareVersions(f.fixedVersion, p.target) > 0) p.target = f.fixedVersion;
-    } else p.unfixed.push(f.id);
-    plan.set(key, p);
-  }
-  return [...plan.values()].sort(
-    (a, b) => (b.kev - a.kev) || severityRank(b.worst) - severityRank(a.worst) || b.cves.length - a.cves.length
-  );
-}
-
-function planToMarkdown(plan) {
-  if (!plan.length) return "";
-  const L = ["## Action plan (fix in this order)", ""];
-  plan.forEach((p, i) => {
-    const eco = ECOSYSTEMS[p.ecosystem];
-    const cmd = p.target && eco ? eco.upgrade(p.name, p.target) : null;
-    L.push(
-      `${i + 1}. **${p.name}@${p.version}**${p.direct === false ? " (transitive)" : ""} — ${p.worst}${p.kev ? " 🔥KEV" : ""}, ${p.cves.length} CVE(s): ${p.cves.join(", ")}`
-    );
-    if (cmd) L.push(`   - Upgrade to **>= ${p.target}**: \`${cmd}\``);
-    if (p.target && String(p.target).split(".")[0] !== String(p.version).split(".")[0])
-      L.push(`   - ⚠️ Major version bump (${p.version} → ${p.target}): review the changelog/breaking changes and update call sites accordingly.`);
-    if (p.direct === false && p.target && eco?.transitiveHint) L.push(`   - ${eco.transitiveHint(p.name, p.target)}`);
-    if (p.unfixed.length) L.push(`   - No fixed version recorded in NVD for: ${p.unfixed.join(", ")} → check references/advisories, consider replacing the package or applying the mitigation.`);
-  });
-  return L.join("\n");
+    : "\n> Note: NVD_API_KEY is not set, so NVD is limited to 5 requests/30s. Get a free key at https://nvd.nist.gov/developers/request-an-api-key and set NVD_API_KEY for ~10x faster NVD lookups.";
 }
 
 function render(findings, format, header, extra = {}) {
@@ -131,6 +81,14 @@ function render(findings, format, header, extra = {}) {
   return text(`${header}\n\n${body}`);
 }
 
+function summaryLine(findings, plan) {
+  const c = (fn) => findings.filter(fn).length;
+  return `Vulnerable packages: ${plan.length} · Findings: ${findings.length} (MALICIOUS: ${c((f) => f.malicious)}, KEV: ${c((f) => f.kev)}, EPSS≥10%: ${c((f) => (f.epss?.probability || 0) >= 0.1)}, CRITICAL: ${c((f) => f.severity === "CRITICAL")}, HIGH: ${c((f) => f.severity === "HIGH")})`;
+}
+
+const NEXT_STEPS =
+  "---\nNext steps: remove malicious packages first, then update manifests + lockfiles to the target versions (prefer the version marked as having no known advisories), search the codebase for usages of the vulnerable APIs described above and apply the code-fix guidance, then re-run the scan to verify.";
+
 // ---------- tools ----------
 
 server.registerTool(
@@ -138,14 +96,18 @@ server.registerTool(
   {
     title: "Scan project dependencies for known vulnerabilities",
     description:
-      "Reads package-lock.json/package.json, requirements*.txt and go.mod in a project directory, checks each dependency version against NVD (CPE version ranges) and CISA KEV, and returns a prioritized action plan with fixed versions, upgrade commands and code-fix guidance. Direct dependencies are scanned first. Use offset to continue a truncated scan.",
+      "Reads lockfiles/manifests (npm package-lock/yarn.lock/pnpm-lock.yaml/package.json, Python poetry.lock/uv.lock/Pipfile.lock/requirements*.txt, go.mod, Cargo.lock, composer.lock, Gemfile.lock, Maven pom.xml/gradle.lockfile/build.gradle, NuGet packages.lock.json/*.csproj) and checks every dependency version against OSV.dev (GitHub Advisory DB, PyPA, Go, RustSec, malicious packages) and NVD, enriched with CISA KEV and EPSS. Returns a prioritized action plan (target version verified clean, latest version, deprecation/maintenance status, upgrade commands) plus detailed findings with code-fix guidance.",
     inputSchema: {
-      path: z.string().describe("Project root directory or a manifest file path"),
-      include_dev: z.boolean().default(false).describe("Include devDependencies"),
-      include_transitive: z.boolean().default(true).describe("Include transitive deps from lockfiles (scanned after direct deps)"),
-      max_packages: z.number().int().min(1).max(500).optional().describe("Max packages to query in this call (default 10 without NVD_API_KEY, 60 with)"),
-      offset: z.number().int().min(0).default(0).describe("Skip the first N packages (to continue a previous scan)"),
-      min_severity: SEVERITY.optional(),
+      path: z.string().describe("Project root directory or a manifest/lockfile path"),
+      recursive: z.boolean().default(false).describe("Also scan sub-directories (monorepos), up to depth 4; skips node_modules, vendor, build output, virtualenvs"),
+      include_dev: z.boolean().default(false).describe("Include dev/test dependencies"),
+      include_transitive: z.boolean().default(true).describe("Include transitive deps from lockfiles"),
+      sources: SOURCES,
+      max_packages: z.number().int().min(1).max(2000).optional().describe("Max packages for the slow NVD cross-check in this call (default 10 without NVD_API_KEY, 60 with). OSV always checks all packages."),
+      offset: z.number().int().min(0).default(0).describe("Continue the NVD cross-check from this package index (OSV results are reported in the offset=0 call)"),
+      check_health: z.boolean().default(true).describe("Report deprecated / yanked / unmaintained direct dependencies via package registries"),
+      min_severity: SEVERITY.optional().describe("Hide findings below this severity (malicious and KEV findings are always shown)"),
+      detailed_findings: z.number().int().min(0).max(500).default(15).describe("How many top-priority findings to show in full detail (the rest are one-line summaries). The action plan always covers every package."),
       format: FORMAT,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -153,48 +115,44 @@ server.registerTool(
   async (args, extra) => {
     try {
       const target = resolve(args.path);
-      let deps = await collectDependencies(target, { includeDev: args.include_dev });
+      const progress = progressFn(extra);
+      let { deps, manifests } = await collectDependencies(target, { includeDev: args.include_dev, recursive: args.recursive });
       if (!args.include_transitive) deps = deps.filter((d) => d.direct !== false);
-      // direct first, then by name
       deps.sort((a, b) => (a.direct === false) - (b.direct === false) || a.name.localeCompare(b.name));
-      if (!deps.length) return text(`No supported manifests with pinned versions found in ${target} (supported: package-lock.json, package.json, requirements*.txt, go.mod).`);
+      if (!deps.length)
+        return text(`No dependencies with resolvable versions found in ${target}.${manifests.length ? ` Manifests seen: ${manifests.join(", ")}` : ""}\nSupported: package-lock.json, yarn.lock, pnpm-lock.yaml, package.json, poetry.lock, uv.lock, Pipfile.lock, requirements*.txt, go.mod, Cargo.lock, composer.lock, Gemfile.lock, pom.xml, gradle.lockfile, build.gradle(.kts), packages.lock.json, *.csproj. Try recursive=true for monorepos.`);
 
+      const useOsv = args.sources !== "nvd" && args.offset === 0;
+      const useNvd = args.sources === "nvd" || args.sources === "both" || (args.sources === "auto" && hasApiKey());
       const max = args.max_packages ?? (hasApiKey() ? 60 : 10);
-      const slice = deps.slice(args.offset, args.offset + max);
-      const filter = minSeverityFilter(args.min_severity);
-      await loadKev();
+      const nvdDeps = useNvd ? deps.slice(args.offset, args.offset + max) : [];
 
-      const findings = [];
-      const errors = [];
-      let i = 0;
-      for (const dep of slice) {
-        await progress(extra, i, slice.length, `${dep.name}@${dep.version}`);
-        try {
-          findings.push(...(await findingsForPackage(dep)).filter(filter));
-        } catch (err) {
-          errors.push(`${dep.name}@${dep.version}: ${err.message}`);
-        }
-        i++;
-      }
-      sortFindings(findings);
-      const plan = actionPlan(findings);
-      const next = args.offset + slice.length;
-      const remaining = deps.length - next;
+      const { findings, errors } = await analyzeDependencies(deps, { useOsv, nvdDeps, minSeverity: args.min_severity, onProgress: progress });
+      await progress("registry lookups");
+      const plan = await enrichPlan(actionPlan(findings));
+      const health = args.check_health ? await healthIssues(deps, new Set(plan.map((p) => `${p.ecosystem}:${p.name}@${p.version}`))) : [];
+
+      const nextOffset = useNvd && args.offset + nvdDeps.length < deps.length ? args.offset + nvdDeps.length : null;
       const ecosystems = [...new Set(deps.map((d) => d.ecosystem))];
-
+      const coverage = {
+        osv: useOsv ? `all ${deps.length} packages` : args.offset > 0 ? "reported in the offset=0 call" : "skipped",
+        nvd: useNvd ? `packages ${args.offset + 1}–${args.offset + nvdDeps.length} of ${deps.length}` : "skipped (set NVD_API_KEY or sources='both' to cross-check NVD CPE data)",
+      };
       if (args.format === "json") {
-        return text(JSON.stringify({ path: target, ecosystems, totalDependencies: deps.length, scanned: { offset: args.offset, count: slice.length }, remaining, nextOffset: remaining > 0 ? next : null, actionPlan: plan, findings, errors }, null, 2));
+        return text(JSON.stringify({ path: target, manifests, ecosystems, totalDependencies: deps.length, coverage, nextOffset, actionPlan: plan, packageHealth: health, findings, errors }, null, 2));
       }
       const head = [
         `# Dependency vulnerability scan: ${target}`,
-        `Ecosystems: ${ecosystems.map((e) => ECOSYSTEMS[e]?.label || e).join(", ")} · Dependencies found: ${deps.length} · Scanned this call: ${slice.length} (offset ${args.offset})`,
-        `Vulnerable packages: ${plan.length} · Findings: ${findings.length} (KEV: ${findings.filter((f) => f.kev).length}, CRITICAL: ${findings.filter((f) => f.severity === "CRITICAL").length}, HIGH: ${findings.filter((f) => f.severity === "HIGH").length})`,
-        remaining > 0 ? `\n⚠️ ${remaining} dependencies not scanned yet → call again with offset=${next}.` : "",
+        `Manifests: ${manifests.join(", ")}`,
+        `Ecosystems: ${ecosystems.map((e) => ECOSYSTEMS[e]?.label || e).join(", ")} · Dependencies: ${deps.length} (direct ${deps.filter((d) => d.direct !== false).length})`,
+        `Coverage: OSV ${coverage.osv} · NVD ${coverage.nvd}`,
+        summaryLine(findings, plan),
+        nextOffset != null ? `\n⚠️ NVD cross-check not finished → call again with offset=${nextOffset}.` : "",
         errors.length ? `\nErrors: ${errors.join("; ")}` : "",
-        rateNote(),
+        useNvd ? rateNote() : "",
       ].filter(Boolean).join("\n");
-      const body = findings.length ? findings.map((f) => findingToMarkdown(f)).join("\n\n") : "_No known vulnerabilities found for the scanned versions._";
-      return text(`${head}\n\n${planToMarkdown(plan)}\n\n## Findings (KEV → HIGH/CRITICAL → newest)\n\n${body}\n\n---\nNext steps: update manifests + lockfiles to the target versions, search the codebase for usages of the vulnerable APIs described above and apply the code-fix guidance, then re-run this scan to verify. Matching is based on NVD CPE data; packages with no CPE entry will not be detected.`);
+      const body = findingsToMarkdown(findings, { detailed: args.detailed_findings });
+      return text([head, planToMarkdown(plan), healthToMarkdown(health), `## Findings (malicious → KEV → EPSS → HIGH/CRITICAL → newest)\n\n${body}`, NEXT_STEPS].filter(Boolean).join("\n\n"));
     } catch (err) {
       return errorResult(err);
     }
@@ -206,27 +164,58 @@ server.registerTool(
   {
     title: "Check a package/product version for vulnerabilities",
     description:
-      "Checks one library or product version (e.g. lodash 4.17.15 on npm, django 3.2.0 on pypi, nginx 1.18.0, openssl 3.0.1) against NVD version ranges and CISA KEV. Returns every CVE affecting that version with fixed version, upgrade command and code-fix guidance.",
+      "Checks one library or product version before installing/upgrading it (e.g. lodash 4.17.15 on npm, django on pypi, org.apache.logging.log4j:log4j-core on maven, nginx 1.18.0). Uses OSV (package advisories + malicious packages) when an ecosystem is given and NVD CPE matching for products, enriched with CISA KEV, EPSS and registry data (latest version, deprecation, last release). If version is omitted the latest published version is checked.",
     inputSchema: {
-      name: z.string().describe("Package or product name, e.g. 'lodash', '@babel/traverse', 'django', 'github.com/gin-gonic/gin', 'nginx'"),
-      version: z.string().describe("Installed version, e.g. '4.17.15'"),
+      name: z.string().describe("Package/product name: 'lodash', '@babel/traverse', 'django', 'github.com/gin-gonic/gin', 'group:artifact' for Maven, 'vendor/package' for Composer, or a product like 'nginx'"),
+      version: z.string().optional().describe("Version to check, e.g. '4.17.15'. Omit to check the latest published version (requires ecosystem)."),
       ecosystem: ECO_ENUM.optional(),
-      vendor: z.string().optional().describe("Optional CPE vendor to narrow results, e.g. 'djangoproject', 'f5', 'openssl'"),
+      vendor: z.string().optional().describe("Optional CPE vendor to narrow NVD results, e.g. 'djangoproject', 'f5', 'openssl'"),
+      sources: SOURCES,
       min_severity: SEVERITY.optional(),
       format: FORMAT,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async (args) => {
+  async (args, extra) => {
     try {
       const eco = resolveEcosystem(args.ecosystem);
-      const dep = { name: args.name, version: args.version.replace(/^v/, ""), ecosystem: eco, direct: true };
-      const findings = (await findingsForPackage(dep, { vendor: args.vendor?.toLowerCase() })).filter(minSeverityFilter(args.min_severity));
-      const plan = actionPlan(findings);
-      if (args.format === "json") return text(JSON.stringify({ package: dep, actionPlan: plan, count: findings.length, findings }, null, 2));
-      const head = `# ${args.name}@${dep.version}${eco ? ` (${ECOSYSTEMS[eco].label})` : ""}: ${findings.length} known vulnerabilit${findings.length === 1 ? "y" : "ies"}${findings.some((f) => f.kev) ? " — includes ACTIVELY EXPLOITED (KEV)" : ""}${rateNote()}`;
-      const body = findings.length ? findings.map((f) => findingToMarkdown(f)).join("\n\n") : "_No known vulnerabilities in NVD for this version (note: only packages with NVD CPE entries can be matched; try vendor or a different product name if unsure)._";
-      return text(`${head}\n\n${planToMarkdown(plan)}\n\n${body}`);
+      let version = args.version?.replace(/^v/, "");
+      let reg = null;
+      if (eco) reg = await getRegistryInfo({ name: args.name, version: version || "0", ecosystem: eco });
+      if (!version) {
+        if (!reg?.latest)
+          return errorResult(
+            eco
+              ? `${args.name} was not found in the ${eco} registry. Check the spelling — a non-existent or misspelled name is a typosquatting risk; do not install a look-alike package. Pass version explicitly to check a product instead.`
+              : "version is required when ecosystem is not given"
+          );
+        version = reg.latest;
+      }
+      const dep = { name: args.name, version, ecosystem: eco, direct: true };
+      const useOsv = Boolean(eco && OSV_ECOSYSTEM[eco]) && args.sources !== "nvd";
+      const useNvd = args.sources === "nvd" || args.sources === "both" || !useOsv || (args.sources === "auto" && hasApiKey());
+      const { findings, errors } = await analyzeDependencies([dep], { useOsv, nvdDeps: useNvd ? [dep] : [], vendor: args.vendor?.toLowerCase(), minSeverity: args.min_severity, onProgress: progressFn(extra) });
+      const plan = await enrichPlan(actionPlan(findings));
+      if (eco && version !== reg?.latest) reg = await getRegistryInfo(dep);
+      if (args.format === "json") return text(JSON.stringify({ package: dep, registry: reg, sources: { osv: useOsv, nvd: useNvd }, actionPlan: plan, count: findings.length, findings, errors }, null, 2));
+
+      const L = [`# ${args.name}@${version}${eco ? ` (${ECOSYSTEMS[eco].label})` : ""}${args.version ? "" : " — latest published version"}`];
+      L.push(`Sources: ${[useOsv && "OSV", useNvd && "NVD"].filter(Boolean).join(" + ")} + CISA KEV + EPSS${errors.length ? ` · Errors: ${errors.join("; ")}` : ""}`);
+      if (reg) {
+        const info = [`latest ${reg.latest}${reg.referenceDate ? ` (${reg.referenceDate})` : ""}`];
+        if (reg.currentDeprecated) info.push(`⚠️ this version is deprecated: ${reg.currentDeprecated}`);
+        else if (reg.deprecated) info.push(`⚠️ package deprecated: ${reg.deprecated}`);
+        if (reg.currentYanked) info.push(`⚠️ this version was yanked (${reg.currentYanked})`);
+        if (reg.stale) info.push(`⚠️ ${reg.stale}`);
+        L.push(`Registry: ${info.join(" · ")}${reg.url ? ` · ${reg.url}` : ""}`);
+      } else if (eco) {
+        L.push(`Registry: package not found in the ${eco} registry — check the name (typosquatting risk if you expected it to exist).`);
+      }
+      L.push(findings.length ? summaryLine(findings, plan) : "✅ No known vulnerabilities for this version.");
+      if (useNvd && !hasApiKey()) L.push(rateNote().trim());
+      if (!useOsv && !eco) L.push("> Tip: pass ecosystem (npm, pypi, go, maven, ...) for precise package-level matching via OSV.");
+      const body = findings.length ? findingsToMarkdown(findings, { detailed: 30 }) : "";
+      return text([L.join("\n"), planToMarkdown(plan), body].filter(Boolean).join("\n\n"));
     } catch (err) {
       return errorResult(err);
     }
@@ -287,6 +276,7 @@ server.registerTool(
         if (filter(f)) findings.push(f);
       }
       findings = sortFindings(findings, { by: "recent" }).slice(0, args.limit);
+      attachEpss(findings, await getEpss(findings.map((f) => f.id)));
       const header = `# Latest ${prof.label} vulnerabilities — last ${range.days} days${args.keyword ? `, keyword "${args.keyword}"` : ""}\nShowing ${findings.length} (KEV first, then newest). ${errors.length ? `Errors: ${errors.join("; ")}` : ""}${rateNote()}\nTip: run scan_project_dependencies to see which of these affect the current project.`;
       return render(findings, args.format, header, { ecosystem: eco, days: range.days, errors });
     } catch (err) {
@@ -337,6 +327,7 @@ server.registerTool(
         if (filter(f)) findings.push(f);
       }
       findings = sortFindings(findings, { by: "recent" }).slice(0, args.limit);
+      attachEpss(findings, await getEpss(findings.map((f) => f.id)));
       return render(findings, args.format, `# NVD search "${args.keyword}" — ${total} total matches, showing ${findings.length} most recent (KEV first)${rateNote()}`, { total });
     } catch (err) {
       return errorResult(err);
@@ -347,13 +338,13 @@ server.registerTool(
 server.registerTool(
   "get_vulnerability",
   {
-    title: "Get full details for a CVE",
+    title: "Get full details for a vulnerability (CVE / GHSA / OSV id)",
     description:
-      "Full CVE details from NVD plus CISA KEV status: description, CVSS, CWE with code-fix guidance, every affected version range with fixed versions, KEV required action/due date and patch/advisory references. Optionally pass the installed package version to get the exact fixed version.",
+      "Full details for one vulnerability by CVE, GHSA, PYSEC, GO, RUSTSEC or MAL id: description, CVSS, EPSS, CWE with code-fix guidance, per-package fixed versions (OSV), every affected range (NVD), CISA KEV required action/due date and patch/advisory references. Pass installed_version (+ ecosystem/package) to get the exact fixed version for your package.",
     inputSchema: {
-      cve_id: z.string().regex(/^CVE-\d{4}-\d{4,}$/i).describe("e.g. CVE-2021-44228"),
+      id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]+$/).describe("e.g. CVE-2021-44228, GHSA-35jh-r3h4-6jhm, PYSEC-2021-19, GO-2022-0969"),
       installed_version: z.string().optional().describe("Your installed version, to compute the nearest fixed version"),
-      product: z.string().optional().describe("CPE product name of the package you use (if the CVE lists several products)"),
+      package: z.string().optional().describe("Package name you use (OSV) or CPE product name (NVD), if the advisory covers several packages"),
       ecosystem: ECO_ENUM.optional(),
       format: FORMAT,
     },
@@ -361,34 +352,108 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const id = args.cve_id.toUpperCase();
-      const [cve, kev] = await Promise.all([getCve(id), getKevEntry(id)]);
-      if (!cve) {
-        if (kev) return text(`${id} not found in NVD, but it is in CISA KEV:\n${JSON.stringify(kev, null, 2)}`);
-        return text(`${id} not found in NVD or CISA KEV.`);
+      const raw = args.id.trim();
+      const isCve = /^CVE-\d{4}-\d+$/i.test(raw);
+      const id = isCve ? raw.toUpperCase() : raw;
+      // OSV: for a CVE, follow its GHSA/other aliases to get package-level fix data
+      const osvRecords = [];
+      try {
+        const first = await getOsvVuln(id);
+        if (first) {
+          if (!isCve || (first.affected || []).some((a) => a.package)) osvRecords.push(first);
+          for (const alias of (first.aliases || []).filter((a) => /^(GHSA|PYSEC|GO|RUSTSEC|RUBYSEC|MAL)-/.test(a)).slice(0, 3)) {
+            const rec = await getOsvVuln(alias);
+            if (rec) osvRecords.push(rec);
+          }
+        }
+      } catch {
+        /* OSV optional */
       }
+      const cveId = isCve ? id : osvRecords.flatMap((r) => [r.id, ...(r.aliases || [])]).find((x) => /^CVE-\d{4}-\d+$/.test(x)) || null;
+      const [cve, kev] = cveId ? await Promise.all([getCve(cveId).catch(() => null), getKevEntry(cveId)]) : [null, null];
+      if (!cve && !osvRecords.length) {
+        if (kev) return text(`${id} not found in NVD/OSV, but it is in CISA KEV:\n${JSON.stringify(kev, null, 2)}`);
+        return text(`${id} not found in NVD, OSV or CISA KEV.`);
+      }
+
       const eco = resolveEcosystem(args.ecosystem);
-      const pkg = args.installed_version
-        ? { name: args.product || affectedRanges(cve)[0]?.product || "package", product: args.product, version: args.installed_version.replace(/^v/, ""), ecosystem: eco, direct: true, confidence: "high" }
-        : null;
-      const f = buildFinding(cve, kev, pkg, { maxRefs: 30 });
-      const fmtRange = (r) => [r.exactVersion && `= ${r.exactVersion}`, r.versionStartIncluding && `>= ${r.versionStartIncluding}`, r.versionStartExcluding && `> ${r.versionStartExcluding}`, r.versionEndExcluding && `< ${r.versionEndExcluding}`, r.versionEndIncluding && `<= ${r.versionEndIncluding}`].filter(Boolean).join(", ") || "all versions";
-      const all = affectedRanges(cve);
-      const wanted = args.product?.toLowerCase();
-      // product of interest first, then ranged (library-style) entries, cap the rest
-      const ordered = [...all.filter((r) => wanted && r.product?.toLowerCase() === wanted), ...all.filter((r) => !(wanted && r.product?.toLowerCase() === wanted))];
-      const seenAff = new Set();
-      const uniq = ordered.filter((r) => { const k = r.criteria + fmtRange(r); return seenAff.has(k) ? false : seenAff.add(k); });
-      const MAX_AFF = 25;
-      f.affected = uniq.slice(0, MAX_AFF).map((r) => ({ cpe: `${r.vendor}:${r.product}${r.targetSw && r.targetSw !== "*" ? ` (${r.targetSw})` : ""}`, range: fmtRange(r) }));
-      if (uniq.length > MAX_AFF) {
-        const vendors = [...new Set(uniq.slice(MAX_AFF).map((r) => r.vendor))];
-        f.affected.push({ cpe: `…and ${uniq.length - MAX_AFF} more configurations`, range: `(vendors: ${vendors.slice(0, 15).join(", ")}${vendors.length > 15 ? ", …" : ""})` });
+      const version = args.installed_version?.replace(/^v/, "");
+      // package table from OSV
+      const pkgRows = [];
+      for (const r of osvRecords) {
+        for (const a of r.affected || []) {
+          if (!a.package) continue;
+          const ranges = (a.ranges || []).filter((x) => x.type !== "GIT").map((x) => {
+            const ev = x.events || [];
+            const parts = [];
+            let intro = null;
+            for (const e of ev) {
+              if (e.introduced !== undefined) intro = e.introduced;
+              else if (e.fixed !== undefined) { parts.push(`${intro && intro !== "0" ? `>= ${intro}, ` : ""}< ${e.fixed}`); intro = null; }
+              else if (e.last_affected !== undefined) { parts.push(`${intro && intro !== "0" ? `>= ${intro}, ` : ""}<= ${e.last_affected} (no fix)`); intro = null; }
+            }
+            if (intro !== null) parts.push(`>= ${intro} (no fix)`);
+            return parts.join("; ");
+          }).filter(Boolean);
+          const key = `${a.package.ecosystem}/${a.package.name}`;
+          const rtext = ranges.join("; ") || (a.versions?.length ? `versions: ${a.versions.slice(0, 10).join(", ")}${a.versions.length > 10 ? ", …" : ""}` : "");
+          const prev = pkgRows.find((p) => p.key === key);
+          if (!prev) pkgRows.push({ key, ecosystem: a.package.ecosystem, name: a.package.name, ranges: rtext });
+          else if (rtext && !prev.ranges.includes(rtext)) prev.ranges = [prev.ranges, rtext].filter(Boolean).join("; ");
+        }
       }
-      if (args.format === "json") return text(JSON.stringify({ finding: f, kevRaw: kev }, null, 2));
+
+      let f;
+      const kevLookup = (x) => (x === cveId ? kev : null);
+      const want = args.package?.toLowerCase();
+      const nameMatches = (n) => !want || [n.toLowerCase(), n.toLowerCase().split(/[:/]/).pop()].includes(want);
+      const osvEcoKey = Object.entries(OSV_ECOSYSTEM).find(([, v]) => pkgRows.some((p) => p.ecosystem === v && nameMatches(p.name)))?.[0];
+      const pkgRow = pkgRows.find((p) => nameMatches(p.name) && (!eco || p.ecosystem === OSV_ECOSYSTEM[eco])) || null;
+      if (cve) {
+        const pkg = version ? { name: args.package || affectedRanges(cve)[0]?.product || "package", product: args.package, version, ecosystem: eco, direct: true, confidence: "high" } : null;
+        f = buildFinding(cve, kev, pkg, { maxRefs: 30 });
+        const fmtRange = (r) => [r.exactVersion && `= ${r.exactVersion}`, r.versionStartIncluding && `>= ${r.versionStartIncluding}`, r.versionStartExcluding && `> ${r.versionStartExcluding}`, r.versionEndExcluding && `< ${r.versionEndExcluding}`, r.versionEndIncluding && `<= ${r.versionEndIncluding}`].filter(Boolean).join(", ") || "all versions";
+        const all = affectedRanges(cve);
+        const wanted = args.package?.toLowerCase();
+        const ordered = [...all.filter((r) => wanted && r.product?.toLowerCase() === wanted), ...all.filter((r) => !(wanted && r.product?.toLowerCase() === wanted))];
+        const seenAff = new Set();
+        const uniq = ordered.filter((r) => { const k = r.criteria + fmtRange(r); return seenAff.has(k) ? false : seenAff.add(k); });
+        const MAX_AFF = 25;
+        f.affected = uniq.slice(0, MAX_AFF).map((r) => ({ cpe: `${r.vendor}:${r.product}${r.targetSw && r.targetSw !== "*" ? ` (${r.targetSw})` : ""}`, range: fmtRange(r) }));
+        if (uniq.length > MAX_AFF) {
+          const vendors = [...new Set(uniq.slice(MAX_AFF).map((r) => r.vendor))];
+          f.affected.push({ cpe: `…and ${uniq.length - MAX_AFF} more configurations`, range: `(vendors: ${vendors.slice(0, 15).join(", ")}${vendors.length > 15 ? ", …" : ""})` });
+        }
+        if (osvRecords.length) {
+          f.sources.push("OSV");
+          f.aliases = [...new Set(osvRecords.flatMap((r) => [r.id, ...(r.aliases || [])]).filter((x) => x !== cveId))];
+          const ghsa = f.aliases.find((x) => x.startsWith("GHSA-"));
+          if (ghsa) f.advisoryUrl = `https://github.com/advisories/${ghsa}`;
+        }
+      } else {
+        const depEco = eco || osvEcoKey;
+        const dep = { name: pkgRow?.name || args.package || "package", version: version || "0.0.0-unknown", ecosystem: depEco, direct: true };
+        f = buildOsvFinding({ primary: osvRecords[0], others: osvRecords.slice(1) }, dep, kevLookup, { maxRefs: 30 });
+        if (!version) Object.assign(f, { package: null, fixedVersion: null, upgradeCommand: null });
+      }
+      // precise package fix from OSV when installed_version given
+      if (version && pkgRow && osvRecords.length) {
+        const depEco = eco || Object.entries(OSV_ECOSYSTEM).find(([, v]) => v === pkgRow.ecosystem)?.[0];
+        const dep = { name: pkgRow.name, version, ecosystem: depEco, direct: true };
+        const of = buildOsvFinding({ primary: osvRecords[0], others: osvRecords.slice(1) }, dep, kevLookup);
+        if (of.fixedVersion) Object.assign(f, { fixedVersion: of.fixedVersion, fixedVersionSource: "OSV", upgradeCommand: of.upgradeCommand, package: of.package });
+      }
+      attachEpss([f], await getEpss([f.id]));
+
+      if (args.format === "json") return text(JSON.stringify({ finding: f, packages: pkgRows, kevRaw: kev }, null, 2));
       let md = findingToMarkdown(f);
+      if (pkgRows.length) {
+        md += `\n- Affected packages (OSV, fixed version = upper bound):`;
+        for (const p of pkgRows.slice(0, 30)) md += `\n  - ${p.ecosystem}/${p.name}: ${p.ranges || "see advisory"}`;
+        if (pkgRows.length > 30) md += `\n  - …and ${pkgRows.length - 30} more`;
+      }
       if (kev?.notes) md += `\n- KEV notes: ${kev.notes}`;
-      if (pkg && !f.fixedVersion) md += `\n- ℹ️ Installed version ${pkg.version} did not match a vulnerable range with a recorded fix${args.product ? "" : " (pass `product` if the CVE covers several products)"} — check the affected ranges above.`;
+      if (version && !f.fixedVersion) md += `\n- ℹ️ Installed version ${version} did not match an affected range with a recorded fix${args.package ? "" : " (pass `package` + `ecosystem` if the advisory covers several packages)"} — check the affected ranges above.`;
       return text(md);
     } catch (err) {
       return errorResult(err);
@@ -407,17 +472,19 @@ server.registerTool(
   async ({ cve_ids }) => {
     try {
       const { catalog } = await loadKev();
+      const epss = await getEpss(cve_ids);
+      const ep = (id) => { const e = epss.get(id.toUpperCase()); return e ? ` · EPSS ${(e.epss * 100).toFixed(1)}% (pct ${(e.percentile * 100).toFixed(0)})` : ""; };
       const L = [`# CISA KEV check (catalog ${catalog.catalogVersion}, ${catalog.count} entries)`, ""];
       const hits = [];
       for (const raw of cve_ids) {
         const k = await getKevEntry(raw.trim());
         if (k) hits.push(k);
-        else L.push(`- ${raw.toUpperCase()}: not in KEV`);
+        else L.push(`- ${raw.toUpperCase()}: not in KEV${ep(raw.trim())}`);
       }
       for (const k of hits) {
-        L.push(`- 🔥 **${k.cveID}** IN KEV — ${k.vendorProject} ${k.product}: ${k.vulnerabilityName}\n  - Added ${k.dateAdded}, due ${k.dueDate}, ransomware: ${k.knownRansomwareCampaignUse}\n  - ${k.shortDescription}\n  - Required action: ${k.requiredAction}${k.notes ? `\n  - Notes: ${k.notes}` : ""}`);
+        L.push(`- 🔥 **${k.cveID}** IN KEV — ${k.vendorProject} ${k.product}: ${k.vulnerabilityName}\n  - Added ${k.dateAdded}, due ${k.dueDate}, ransomware: ${k.knownRansomwareCampaignUse}${ep(k.cveID)}\n  - ${k.shortDescription}\n  - Required action: ${k.requiredAction}${k.notes ? `\n  - Notes: ${k.notes}` : ""}`);
       }
-      L.splice(1, 0, `${hits.length} of ${cve_ids.length} are known exploited. Fix those first; use get_vulnerability for fixed versions.`);
+      L.splice(1, 0, `${hits.length} of ${cve_ids.length} are known exploited. Fix those first; use get_vulnerability for fixed versions. EPSS = probability of exploitation in the next 30 days.`);
       return text(L.join("\n"));
     } catch (err) {
       return errorResult(err);
@@ -472,9 +539,9 @@ server.registerPrompt(
         content: {
           type: "text",
           text: `Run a security audit of the project at ${path || "the current working directory"} using the vuln-watch tools:
-1. Call scan_project_dependencies (continue with offset until no dependencies remain).
+1. Call scan_project_dependencies with recursive=true (continue with offset if it says the NVD cross-check is not finished).
 2. Call latest_ecosystem_vulnerabilities for each detected ecosystem (days=30) to catch brand-new issues.
-3. Fix in priority order: CISA KEV → CRITICAL → HIGH. For each: update the manifest and lockfile to the fixed version (use overrides/resolutions for transitive deps), and grep the codebase for usage of the vulnerable feature, applying the CWE code-fix guidance.
+3. Fix in priority order: MALICIOUS packages (remove) → CISA KEV → high EPSS → CRITICAL → HIGH; also replace deprecated/unmaintained packages from the package health section. For each: update the manifest and lockfile to the fixed version (use overrides/resolutions for transitive deps), and grep the codebase for usage of the vulnerable feature, applying the CWE code-fix guidance.
 4. Re-run the scan to verify, then summarize what was fixed, what remains (no fix available) and recommended mitigations.`,
         },
       },

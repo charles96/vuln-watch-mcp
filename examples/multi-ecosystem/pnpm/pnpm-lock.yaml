@@ -1,0 +1,27 @@
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      express:
+        specifier: 4.17.1
+        version: 4.17.1
+
+packages:
+
+  express@4.17.1:
+    resolution: {integrity: sha512-abc}
+    engines: {node: '>= 0.10.0'}
+
+  qs@6.7.0:
+    resolution: {integrity: sha512-def}
+
+  '@babel/traverse@7.22.0':
+    resolution: {integrity: sha512-ghi}
+
+snapshots:
+
+  express@4.17.1:
+    dependencies:
+      qs: 6.7.0
