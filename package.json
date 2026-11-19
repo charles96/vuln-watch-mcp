@@ -1,0 +1,22 @@
+{
+  "name": "vuln-watch-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that searches CISA KEV and NVD for security vulnerabilities",
+  "type": "module",
+  "bin": {
+    "vuln-watch-mcp": "src/index.js"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  }
+}
