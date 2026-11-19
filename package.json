@@ -1,6 +1,6 @@
 {
   "name": "vuln-watch-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for Claude Code/Codex: find and fix vulnerable dependencies using OSV, NVD, CISA KEV, EPSS and package registries",
   "type": "module",
   "bin": {
@@ -25,6 +25,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "smol-toml": "^1.9.1",
     "zod": "^4.6.7"
   },
   "keywords": [

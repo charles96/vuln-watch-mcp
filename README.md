@@ -8,7 +8,8 @@ Claude Code나 Codex가 코딩 중에 **보안 취약점을 찾고, 수정 방�
 | [NVD CVE API 2.0](https://services.nvd.nist.gov/rest/json/cves/2.0) | CVE 상세, CVSS, CWE, 영향받는 제품·버전 범위(CPE), 패치 링크 |
 | [CISA KEV](https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json) | 실제로 악용되고 있는 취약점 (조치 기한, 랜섬웨어 악용 여부, 필수 조치) |
 | [FIRST EPSS](https://www.first.org/epss/) | 앞으로 30일 안에 실제로 악용될 확률 |
-| 패키지 레지스트리 | npm, PyPI, Go proxy, crates.io, RubyGems, Packagist, NuGet, Maven Central의 최신 버전, deprecated/yank 여부, 마지막 배포일 |
+| 패키지 레지스트리 | npm, PyPI, Go proxy, crates.io, RubyGems, Packagist, NuGet, Maven Central, pub.dev, Hex, CRAN의 최신 버전, deprecated/yank/retire 여부, 마지막 배포일 |
+| Maven Central / Google Maven | Java/Kotlin의 부모 POM, BOM, 간접 의존성 해석 (Maven/Gradle을 실행하지 않고 POM을 직접 읽음) |
 
 모두 무료이고, 필수로 받아야 하는 API 키가 없습니다.
 
@@ -99,20 +100,54 @@ NVD 키가 있으면 아래가 달라집니다. [여기서 신청](https://nvd.n
 - "GHSA-35jh-r3h4-6jhm 뭐야?"
 - Claude Code에서 `/mcp__vuln-watch__security_audit`: 스캔 → 최신 취약점 확인 → 수정 → 재검증을 한 번에 진행합니다.
 
-## 지원하는 의존성 파일
+## 지원하는 언어와 의존성 파일
 
 `scan_project_dependencies`가 읽는 파일입니다. 같은 폴더에 lockfile이 있으면 lockfile을 우선합니다. `recursive: true`로 하위 폴더(모노레포)까지 찾습니다.
 
-| 언어 | 파일 |
+| 언어 | lockfile (정확한 버전) | lockfile이 없을 때 |
+|---|---|---|
+| JavaScript/TypeScript | `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5~v9), `yarn.lock` (v1, berry), `bun.lock` | 설치된 `node_modules`의 실제 버전 → 없으면 `package.json` 범위로 추정 |
+| Python | `poetry.lock`, `uv.lock`, `pdm.lock`, `pylock.toml` (PEP 751), `Pipfile.lock` | `requirements*.txt`(`-r` 포함 파일 추적), `pyproject.toml` (PEP 621, PEP 735, Poetry) |
+| Go | `go.mod` (`replace` 반영, `toolchain` 지시어가 있으면 **Go 표준 라이브러리**도 점검) | |
+| Rust | `Cargo.lock` | `Cargo.toml` |
+| PHP | `composer.lock` | `composer.json` |
+| Ruby | `Gemfile.lock` | `Gemfile` |
+| Java/Kotlin | `gradle.lockfile` | `pom.xml`, `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` → 아래 설명처럼 해석 |
+| C# / .NET | `packages.lock.json`, `obj/project.assets.json` (`dotnet restore` 결과, 간접 의존성 포함) | `*.csproj`/`*.fsproj`/`*.vbproj` + `Directory.Packages.props` (중앙 패키지 관리), `packages.config` (.NET Framework) |
+| Dart/Flutter | `pubspec.lock` | |
+| Elixir | `mix.lock` | |
+| Swift | `Package.resolved` (v1~v3) | |
+| R | `renv.lock` | |
+
+### Java / Kotlin 해석 방식
+
+Maven이나 Gradle을 실행하지 않고 Maven Central과 Google Maven의 POM을 직접 읽어 해석합니다. 받은 POM은 30일 동안 캐시합니다.
+
+- **Maven (`pom.xml`)**
+  - 부모 POM을 상속합니다. 로컬 `relativePath`를 먼저 찾고, 없으면 Maven Central에서 받습니다.
+  - `${property}`를 치환하고 `dependencyManagement`와 BOM(`scope=import`)을 적용합니다. 그래서 Spring Boot처럼 **버전을 적지 않은 의존성**도 해석합니다.
+  - 간접 의존성은 compile/runtime 범위만 따라가고, optional과 exclusions를 반영하며, 가장 가까운 버전을 선택합니다(Maven 규칙).
+  - 멀티 모듈 프로젝트의 내부 모듈은 제외합니다.
+- **Gradle (`build.gradle`, `build.gradle.kts`)**
+  - 문자열·map·Kotlin 표기법을 읽고, `$변수`(`ext`, `val`, `gradle.properties`)를 치환합니다.
+  - 버전 카탈로그(`gradle/libs.versions.toml`)의 libraries, bundles, plugins를 해석합니다. 상위 폴더의 카탈로그도 `settings.gradle`이 있는 위치까지 올라가 찾습니다.
+  - `platform()`, `enforcedPlatform()`, `mavenBom`과 **Spring Boot 플러그인의 BOM**을 적용해 버전 없는 의존성을 해석합니다.
+  - 간접 의존성은 가장 높은 버전을 선택합니다(Gradle 규칙).
+- **Android:** `androidx`, `com.google.android` 등은 Google Maven에서 받습니다.
+
+### 버전 출처 표시
+
+스캔 결과 머리말에 각 의존성의 버전을 어디서 얻었는지 집계해 보여 줍니다.
+
+| 출처 | 의미 |
 |---|---|
-| JavaScript/TypeScript | `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock` (v1, berry), `pnpm-lock.yaml` (v5~v9), `package.json` |
-| Python | `poetry.lock`, `uv.lock`, `Pipfile.lock`, `requirements*.txt` |
-| Go | `go.mod` |
-| Rust | `Cargo.lock` |
-| PHP | `composer.lock` |
-| Ruby | `Gemfile.lock` |
-| Java/Kotlin | `gradle.lockfile`, `pom.xml` (`${property}` 치환), `build.gradle`, `build.gradle.kts` |
-| .NET | `packages.lock.json`, `*.csproj`/`*.fsproj`/`*.vbproj`, `Directory.Packages.props` |
+| lockfile | lockfile에 기록된 정확한 버전 |
+| installed | 실제 설치된 패키지(`node_modules`)에서 읽은 버전 |
+| exact pin | 매니페스트에 `==1.2.3`처럼 정확히 고정된 버전 |
+| resolved graph | 부모 POM, BOM, 간접 의존성 해석으로 계산한 버전 (Maven/Gradle) |
+| estimated from range | `^1.2.3`, `>=1.2` 같은 범위의 하한으로 **추정**한 버전 |
+
+추정한 버전에서 나온 결과에는 "⚠️ 범위에서 추정한 버전이라 오탐일 수 있음" 안내가 붙습니다.
 
 ## 도구
 
@@ -129,7 +164,7 @@ NVD 키가 있으면 아래가 달라집니다. [여기서 신청](https://nvd.n
 공통 사항:
 - **우선순위:** 🚨 악성 패키지 → 🔥 KEV(실제 악용) → ⚠️ EPSS 10% 이상 → CRITICAL/HIGH → 최신순
 - **심각도 값:** `min_severity`에는 `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`을 넣습니다.
-- **생태계 값:** `ecosystem`에는 `npm`(`javascript`, `typescript`, `node`), `pypi`(`python`), `go`, `maven`(`java`, `kotlin`), `composer`(`php`), `rubygems`(`ruby`), `cargo`(`rust`), `nuget`(`dotnet`)을 쓸 수 있습니다. 괄호 안은 같은 뜻으로 받는 별칭입니다.
+- **생태계 값:** `ecosystem`에는 `npm`(`javascript`, `typescript`, `node`), `pypi`(`python`), `go`, `maven`(`java`, `kotlin`, `gradle`), `nuget`(`dotnet`, `csharp`, `c#`, `fsharp`), `composer`(`php`), `rubygems`(`ruby`), `cargo`(`rust`), `pub`(`dart`, `flutter`), `hex`(`elixir`, `erlang`), `swift`, `cran`(`r`)을 쓸 수 있습니다. 괄호 안은 같은 뜻으로 받는 별칭입니다.
 - **데이터 소스 선택:** `sources`에는 `auto`(기본: OSV, 키가 있으면 NVD 교차 확인 추가), `osv`, `nvd`, `both`를 쓸 수 있습니다.
 - **결과 형식:** `check_kev`를 뺀 모든 도구는 `format: "json"`으로 구조화된 결과를 받을 수 있습니다 (기본값 `markdown`).
 
@@ -149,7 +184,7 @@ NVD 키가 있으면 아래가 달라집니다. [여기서 신청](https://nvd.n
 | `path` | ✅ | | 프로젝트 루트 폴더 또는 의존성 파일 경로 |
 | `recursive` | | `false` | 하위 폴더까지 스캔 (깊이 4, `node_modules`·`vendor`·빌드 결과·가상환경 제외) |
 | `include_dev` | | `false` | dev/test 의존성 포함 |
-| `include_transitive` | | `true` | lockfile의 간접 의존성 포함 |
+| `include_transitive` | | `true` | 간접 의존성 포함 (lockfile 기준, Maven/Gradle은 POM을 따라가 해석) |
 | `sources` | | `auto` | 데이터 소스 선택 |
 | `max_packages` | | 키 없음 10 / 키 있음 60 | 이번 호출에서 **NVD 교차 확인**할 패키지 수 (OSV는 항상 전체) |
 | `offset` | | `0` | NVD 교차 확인을 이어서 할 시작 위치 (OSV 결과는 `offset=0` 호출에만 나옴) |
@@ -171,7 +206,7 @@ NVD 키가 있으면 아래가 달라집니다. [여기서 신청](https://nvd.n
 
 | 파라미터 | 필수 | 기본값 | 설명 |
 |---|---|---|---|
-| `name` | ✅ | | 패키지/제품 이름. 예: `lodash`, `@babel/traverse`, `django`, `github.com/gin-gonic/gin`, `org.apache.logging.log4j:log4j-core`(Maven), `guzzlehttp/guzzle`(Composer), `nginx` |
+| `name` | ✅ | | 패키지/제품 이름. 예: `lodash`, `@babel/traverse`, `django`, `github.com/gin-gonic/gin`, `stdlib`(Go 표준 라이브러리), `org.apache.logging.log4j:log4j-core`(Maven), `Newtonsoft.Json`(NuGet), `guzzlehttp/guzzle`(Composer), `github.com/apple/swift-nio`(Swift), `nginx` |
 | `version` | | 최신 버전 | 점검할 버전 (생략하려면 `ecosystem` 필요) |
 | `ecosystem` | | | 생태계. 지정하면 OSV로 정확히 매칭하고 업그레이드 명령을 만들어 줍니다. |
 | `vendor` | | | NVD 결과를 좁힐 CPE 벤더 이름. 예: `djangoproject`, `f5`, `openssl` |
@@ -288,7 +323,7 @@ KEV 카탈로그를 직접 검색합니다(최근 추가순). "최근 한 달간
 | 수정 버전 | OSV의 패키지별 수정 버전을 우선 사용합니다. NVD만 있으면 버전 범위 상한을 쓰고, CVE 설명의 "fixed in X"와 비교해 더 높은 쪽을 권장합니다. |
 | 검증된 목표 버전 | 목표 버전에 남은 취약점이 없는지 OSV로 다시 확인합니다. 남아 있으면 실제로 배포된 버전 중에서 깨끗한 버전이 나올 때까지 올립니다. |
 | 최신 버전 | 레지스트리 최신 버전, 배포일, 그 버전의 취약점 여부 |
-| 업그레이드 명령 | `npm install x@y`, `pip install "x>=y"`, `go get x@vY`, `cargo update -p`, `composer require`, `bundle update`, `dotnet add package` 등 |
+| 업그레이드 명령 | `npm install x@y`, `pip install "x>=y"`, `go get x@vY`(표준 라이브러리는 `go get toolchain@goX`), `cargo update -p`, `composer require`, `bundle update`, `dotnet add package`(중앙 패키지 관리 안내 포함), `dart pub add`, `mix deps.update` 등 |
 | 간접 의존성 | `npm ls`, `overrides`/`resolutions`/`pnpm.overrides`, constraints로 고정하는 방법 |
 | 패키지 상태 | deprecated, yank, 2년 이상 배포 없음, npm 보안 자리표시자(악성 패키지 삭제 흔적) |
 | 메이저 업그레이드 경고 | 호환성이 깨지는 변경이 있을 수 있으면 경고 |
@@ -306,12 +341,14 @@ vuln-watch-mcp/
 ├── src/
 │   ├── index.js         # MCP 서버 진입점: 도구 7개, security_audit 프롬프트, 서버 안내문
 │   ├── scan.js          # 분석 파이프라인: OSV+NVD 병합, KEV/EPSS 부착, 조치 계획, 목표 버전 검증, 패키지 상태
-│   ├── deps.js          # 의존성 파일 파서 (8개 생태계, 20여 종 파일), 하위 폴더 탐색
+│   ├── deps.js          # 의존성 파일 파서 (12개 생태계, 35종 이상 파일), 하위 폴더 탐색, 버전 출처 표시
+│   ├── maven.js         # Maven 해석기: 부모 POM, 속성 치환, BOM, 간접 의존성 (Maven Central / Google Maven)
+│   ├── gradle.js        # Gradle 해석기: 버전 카탈로그, 변수, platform()/Spring Boot BOM
 │   ├── osv.js           # OSV.dev 클라이언트 (일괄 조회, 상세 조회, 중복 권고 묶기)
 │   ├── nvd.js           # NVD API 클라이언트 (속도 제한, 재시도, 캐시), CVSS/CPE 파싱, 버전 비교
 │   ├── kev.js           # CISA KEV 카탈로그 다운로드, 캐시, 검색
 │   ├── epss.js          # FIRST EPSS 일괄 조회
-│   ├── registry.js      # 8개 패키지 레지스트리 조회 (최신 버전, deprecated, yank, 배포일)
+│   ├── registry.js      # 11개 패키지 레지스트리 조회 (최신 버전, deprecated, yank/retire, 배포일)
 │   ├── report.js        # 결과 생성: 수정 버전 계산, 업그레이드 명령, 정렬, Markdown 출력
 │   ├── cvss.js          # CVSS 3.x 벡터로 점수 계산 (OSV는 벡터만 제공)
 │   ├── ecosystems.js    # 언어별 설정 (CPE 플랫폼, 검색 키워드, 업그레이드 명령 템플릿)
@@ -322,7 +359,9 @@ vuln-watch-mcp/
 ├── examples/
 │   ├── vulnerable-node/     # npm 샘플 (lodash, minimist, jsonwebtoken)
 │   ├── vulnerable-python/   # Python 샘플 (django, requests)
-│   └── multi-ecosystem/     # 8개 생태계 lockfile 샘플 (악성 패키지, KEV 취약점 포함)
+│   └── multi-ecosystem/     # 12개 생태계 샘플: Spring Boot(Maven 부모 POM), Gradle 버전 카탈로그,
+│                            #   .NET 중앙 패키지 관리/packages.config, pyproject, bun, Go toolchain,
+│                            #   Dart, Elixir, Swift, R (악성 패키지, KEV 취약점 포함)
 ├── package.json
 └── README.md
 ```
@@ -346,8 +385,9 @@ node scripts/smoke.js latest_ecosystem_vulnerabilities '{"ecosystem":"npm","days
 | `NVD_TTL_HOURS` | 12 | NVD 응답 캐시 유지 시간 |
 | `OSV_TTL_HOURS` | 6 | OSV 응답 캐시 유지 시간 |
 | `VULN_WATCH_CACHE_DIR` | `~/.cache/vuln-watch-mcp` | 디스크 캐시 위치 |
+| `MAVEN_REPO_URL` | `https://repo1.maven.org/maven2` | POM을 받을 Maven 저장소 (사내 Nexus/Artifactory 미러를 쓸 때) |
 
-EPSS는 24시간, 레지스트리 정보는 6시간 동안 캐시합니다.
+EPSS는 24시간, 레지스트리 정보는 6시간, Maven POM은 30일 동안 캐시합니다.
 
 ## 문제 해결
 
@@ -361,9 +401,17 @@ EPSS는 24시간, 레지스트리 정보는 6시간 동안 캐시합니다.
 
 ## 한계
 
-- **lockfile이 없으면 버전이 부정확합니다.** `package.json`, `build.gradle`, `*.csproj`처럼 범위로 적힌 파일만 있으면 `^1.2.3`을 최소 버전(`1.2.3`)으로 간주하므로 오탐이 생길 수 있습니다. 간접 의존성은 lockfile이 있어야 보입니다.
-- **`pom.xml`은 부분적으로만 해석합니다.** 직접 선언된 의존성과 `${property}` 치환만 처리하고, 부모 POM이나 BOM으로 관리되는 버전은 해석하지 못합니다. 정확한 결과가 필요하면 `gradle.lockfile`을 쓰거나 `mvn dependency:list` 결과를 참고하세요.
-- **NVD 매칭(`sources: nvd`/`both`)은 이름 추측에 의존합니다.** 패키지 이름을 CPE 제품 이름으로 바꿔 찾기 때문에 `Match confidence: medium` 결과는 같은 프로젝트인지 직접 확인해야 합니다. OSV(기본값)는 패키지 이름으로 바로 조회하므로 이 문제가 없습니다.
-- **신규 CVE의 상세 정보가 늦게 붙습니다.** NVD가 아직 분석하지 않은(`Awaiting Analysis`) CVE는 점수나 영향 범위가 비어 있을 수 있습니다. OSV에 GitHub 권고가 있으면 그쪽 정보로 보완됩니다.
+- **lockfile이 없으면 버전이 추정치입니다.** `package.json`, `Cargo.toml`, `composer.json`, `Gemfile`, `pyproject.toml`, `*.csproj`처럼 범위로 적힌 파일만 있으면 범위의 하한을 버전으로 간주합니다. 이런 결과에는 "추정" 표시가 붙지만 오탐일 수 있으니 lockfile을 두는 것이 가장 정확합니다.
+  - **Gradle:** `dependencyLocking { lockAllConfigurations() }`
+  - **.NET:** `<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>` 또는 `dotnet restore` 후 생기는 `obj/project.assets.json`
+- **Maven/Gradle 해석은 근사치입니다.** 실제 빌드 도구를 실행하지 않으므로 다음은 반영하지 못합니다.
+  - Maven profiles, 버전 범위(`[1.0,2.0)`), classifier별 의존성
+  - Gradle convention plugin이나 `buildSrc`에서 추가하는 의존성, 동적 버전(`1.+`), `resolutionStrategy`
+  - 해석하지 못한 의존성은 결과의 Notes에 "해석 불가"로 표시됩니다. 정확한 결과가 필요하면 `gradle.lockfile`을 쓰거나 `mvn dependency:tree`로 교차 확인하세요.
+- **사내 저장소:** 사내 Maven 저장소에만 있는 아티팩트는 `MAVEN_REPO_URL`로 미러를 지정해야 해석됩니다. 인증이 필요한 저장소는 지원하지 않습니다.
+- **Go 표준 라이브러리:** `go.mod`에 `toolchain` 지시어가 있을 때만 점검합니다. 실제 빌드 툴체인이 다르면 `check_package`(`name: "stdlib"`, `ecosystem: "go"`)로 직접 확인하세요.
+- **.NET 간접 의존성:** `packages.lock.json`이나 `obj/project.assets.json`이 있어야 보입니다.
+- **NVD 매칭(`sources: nvd`/`both`)은 이름 추측에 의존합니다.** `Match confidence: medium` 결과는 같은 프로젝트인지 직접 확인해야 합니다. OSV(기본값)는 패키지 이름으로 바로 조회하므로 이 문제가 없습니다.
+- **신규 CVE의 상세 정보가 늦게 붙습니다.** NVD가 아직 분석하지 않은 CVE는 점수나 영향 범위가 비어 있을 수 있습니다. Go 취약점 DB처럼 CVSS가 없는 권고는 같은 CVE의 점수로 보완합니다.
 - **목표 버전 검증은 OSV 기준입니다.** OSV에 없는 취약점까지 없다는 보장은 아닙니다.
-- **컨테이너 이미지, OS 패키지, 소스 코드 자체의 취약점(SAST)은 범위 밖입니다.**
+- **범위 밖:** 컨테이너 이미지, OS 패키지, C/C++ 의존성, 소스 코드 자체의 취약점(SAST)은 점검하지 않습니다.

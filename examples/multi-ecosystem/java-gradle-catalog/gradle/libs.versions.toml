@@ -1,0 +1,15 @@
+[versions]
+springBoot = "2.7.0"
+jackson = "2.13.2"
+
+[libraries]
+jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
+commons-text = "org.apache.commons:commons-text:1.9"
+guava = { group = "com.google.guava", name = "guava", version = "30.0-jre" }
+junit = "junit:junit:4.12"
+
+[bundles]
+utils = ["commons-text", "guava"]
+
+[plugins]
+spring-boot = { id = "org.springframework.boot", version.ref = "springBoot" }

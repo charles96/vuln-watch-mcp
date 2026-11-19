@@ -19,7 +19,10 @@ export const ECOSYSTEMS = {
     label: "Go modules",
     targetSw: ["go", "golang"],
     keywords: ["golang", "go module"],
-    upgrade: (n, v) => `go get ${n}@v${v.replace(/^v/, "")} && go mod tidy`,
+    upgrade: (n, v) =>
+      n === "stdlib" || n === "toolchain"
+        ? `go get toolchain@go${v.replace(/^v/, "")}  (sets the toolchain line in go.mod; also update CI images / Dockerfile, then rebuild)`
+        : `go get ${n}@v${v.replace(/^v/, "")} && go mod tidy`,
     transitiveHint: (n, v) => `indirect: go get ${n}@v${v.replace(/^v/, "")} && go mod tidy`,
   },
   maven: {
@@ -47,10 +50,37 @@ export const ECOSYSTEMS = {
     upgrade: (n, v) => `cargo update -p ${n} --precise ${v}  (or bump in Cargo.toml)`,
   },
   nuget: {
-    label: ".NET (NuGet)",
-    targetSw: [".net", "asp.net"],
+    label: ".NET / C# (NuGet)",
+    targetSw: [".net", "asp.net", ".net_framework", ".net_core"],
     keywords: ["nuget", ".net"],
-    upgrade: (n, v) => `dotnet add package ${n} --version ${v}`,
+    upgrade: (n, v) => `dotnet add package ${n} --version ${v}  (central package management: update <PackageVersion Include="${n}"> in Directory.Packages.props)`,
+    transitiveHint: (n, v) => `transitive: add a direct <PackageReference Include="${n}" Version="${v}" /> (or enable CentralPackageTransitivePinningEnabled with a PackageVersion entry).`,
+  },
+  pub: {
+    label: "Dart / Flutter (pub)",
+    targetSw: ["dart", "flutter"],
+    keywords: ["dart package", "flutter"],
+    upgrade: (n, v) => `dart pub add ${n}:^${v}  (Flutter: flutter pub add ${n}:^${v})`,
+    transitiveHint: (n, v) => `transitive: add dependency_overrides: { ${n}: ^${v} } to pubspec.yaml or upgrade the parent package (dart pub deps).`,
+  },
+  hex: {
+    label: "Elixir / Erlang (Hex)",
+    targetSw: ["elixir", "erlang"],
+    keywords: ["elixir", "hex package"],
+    upgrade: (n, v) => `update mix.exs to {:${n}, "~> ${v}"} and run mix deps.update ${n}`,
+    transitiveHint: (n, v) => `transitive: add {:${n}, "~> ${v}", override: true} to mix.exs deps.`,
+  },
+  swift: {
+    label: "Swift (SwiftPM)",
+    targetSw: ["swift", "iphone_os", "macos"],
+    keywords: ["swift package", "swiftpm"],
+    upgrade: (n, v) => `update .package(url: "https://${n}", from: "${v}") in Package.swift and run swift package update`,
+  },
+  cran: {
+    label: "R (CRAN)",
+    targetSw: ["r"],
+    keywords: ["r package", "cran"],
+    upgrade: (n, v) => `install.packages("${n}") (>= ${v}) then renv::snapshot()`,
   },
 };
 
@@ -62,7 +92,11 @@ export const ECOSYSTEM_ALIASES = {
   php: "composer",
   ruby: "rubygems", gem: "rubygems", rails: "rubygems",
   rust: "cargo", crates: "cargo",
-  dotnet: "nuget", ".net": "nuget", csharp: "nuget", "c#": "nuget",
+  dotnet: "nuget", ".net": "nuget", csharp: "nuget", "c#": "nuget", fsharp: "nuget", "f#": "nuget", vb: "nuget",
+  dart: "pub", flutter: "pub",
+  elixir: "hex", erlang: "hex", mix: "hex",
+  swiftpm: "swift", ios: "swift",
+  r: "cran", renv: "cran",
 };
 
 export function resolveEcosystem(name) {

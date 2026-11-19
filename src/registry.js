@@ -87,6 +87,37 @@ const FETCHERS = {
     const stable = j.versions.filter(isStable).sort(compareVersions);
     return { latest: (stable.length ? stable : j.versions).at(-1), versions: j.versions, url: `https://www.nuget.org/packages/${name}` };
   },
+  async pub(name, version) {
+    const j = await getJson(`https://pub.dev/api/packages/${name}`);
+    if (!j?.latest) return null;
+    const cur = (j.versions || []).find((v) => v.version === version);
+    return {
+      latest: j.latest.version,
+      versions: (j.versions || []).map((v) => v.version),
+      latestReleased: j.latest.published?.slice(0, 10),
+      currentYanked: cur?.retracted ? "retracted" : null,
+      deprecated: j.isDiscontinued ? `discontinued${j.replacedBy ? ` → use ${j.replacedBy}` : ""}` : null,
+      url: `https://pub.dev/packages/${name}`,
+    };
+  },
+  async hex(name, version) {
+    const j = await getJson(`https://hex.pm/api/packages/${name}`);
+    if (!j) return null;
+    const ret = j.retirements?.[version];
+    const releases = j.releases || [];
+    return {
+      latest: j.latest_stable_version || j.latest_version,
+      versions: releases.map((r) => r.version),
+      latestReleased: releases.find((r) => r.version === (j.latest_stable_version || j.latest_version))?.inserted_at?.slice(0, 10),
+      currentYanked: ret ? `retired: ${ret.reason}${ret.message ? ` — ${ret.message}` : ""}` : null,
+      url: j.html_url || `https://hex.pm/packages/${name}`,
+    };
+  },
+  async cran(name) {
+    const j = await getJson(`https://crandb.r-pkg.org/${name}`);
+    if (!j?.Version) return null;
+    return { latest: j.Version, latestReleased: (j["Date/Publication"] || "").slice(0, 10) || undefined, url: `https://cran.r-project.org/package=${name}` };
+  },
   async maven(name) {
     const [g, a] = name.split(":");
     const res = await fetch(`https://repo1.maven.org/maven2/${g.replace(/\./g, "/")}/${a}/maven-metadata.xml`, { headers: UA, signal: AbortSignal.timeout(20_000) });
@@ -109,7 +140,7 @@ const FETCHERS = {
 /** Registry info for a package; null when unsupported/unavailable. */
 export async function getRegistryInfo(dep) {
   const fn = FETCHERS[dep.ecosystem];
-  if (!fn) return null;
+  if (!fn || (dep.ecosystem === "go" && dep.name === "stdlib")) return null;
   const key = `reg:${dep.ecosystem}:${dep.name}@${dep.version}`;
   const hit = await cacheGet(key, TTL);
   if (hit !== undefined) return hit;

@@ -1,0 +1,4 @@
+%{
+  "plug": {:hex, :plug, "1.3.0", "abc", [:mix], [{:mime, "~> 1.0", [hex: :mime, repo: "hexpm", optional: false]}], "hexpm", "def"},
+  "mime": {:hex, :mime, "1.6.0", "abc", [:mix], [], "hexpm", "def"},
+}

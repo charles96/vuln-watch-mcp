@@ -18,7 +18,7 @@ const VERSION = "0.2.0";
 const NVD_MAX_RANGE_DAYS = 120;
 const ECO_ENUM = z
   .string()
-  .describe("Language/ecosystem: npm|javascript|typescript, pypi|python, go, maven|java, composer|php, rubygems|ruby, cargo|rust, nuget|dotnet");
+  .describe("Language/ecosystem: npm|javascript|typescript, pypi|python, go, maven|java|kotlin, nuget|dotnet|csharp, composer|php, rubygems|ruby, cargo|rust, pub|dart|flutter, hex|elixir, swift, cran|r");
 const SEVERITY = z.enum(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
 const FORMAT = z.enum(["markdown", "json"]).default("markdown").describe("markdown for reading, json for structured processing");
 const SOURCES = z
@@ -29,7 +29,8 @@ const SOURCES = z
 const INSTRUCTIONS = `vuln-watch: security vulnerability intelligence from OSV.dev (package advisories incl. GitHub Advisory DB and malicious packages), NVD (CVE details), CISA KEV (actively exploited) and FIRST EPSS (exploit probability), plus package registry metadata.
 Use it to find AND FIX vulnerabilities while coding:
 - Before adding/upgrading a dependency → check_package (version optional = latest). It also flags malicious, deprecated and unmaintained packages.
-- When asked about project security, or after changing manifests/lockfiles → scan_project_dependencies (path = project root, recursive=true for monorepos).
+- When asked about project security, or after changing manifests/lockfiles → scan_project_dependencies (path = project root, recursive=true for monorepos). Supports JS/TS, Python, Go (incl. stdlib), Rust, PHP, Ruby, Java/Kotlin (Maven parent POM/BOM, Gradle version catalogs, transitive resolution), C#/.NET, Dart/Flutter, Elixir, Swift and R.
+- Findings whose version was estimated from a range (no lockfile) can be false positives: say so and recommend adding a lockfile.
 - To learn what is newly vulnerable in the project's language → latest_ecosystem_vulnerabilities.
 - When a CVE/GHSA/PYSEC/GO/RUSTSEC ID appears (logs, audit output, advisories) → get_vulnerability.
 Priority: 🚨 malicious package → 🔥 CISA KEV → high EPSS → CRITICAL/HIGH.
@@ -96,12 +97,12 @@ server.registerTool(
   {
     title: "Scan project dependencies for known vulnerabilities",
     description:
-      "Reads lockfiles/manifests (npm package-lock/yarn.lock/pnpm-lock.yaml/package.json, Python poetry.lock/uv.lock/Pipfile.lock/requirements*.txt, go.mod, Cargo.lock, composer.lock, Gemfile.lock, Maven pom.xml/gradle.lockfile/build.gradle, NuGet packages.lock.json/*.csproj) and checks every dependency version against OSV.dev (GitHub Advisory DB, PyPA, Go, RustSec, malicious packages) and NVD, enriched with CISA KEV and EPSS. Returns a prioritized action plan (target version verified clean, latest version, deprecation/maintenance status, upgrade commands) plus detailed findings with code-fix guidance.",
+      "Reads lockfiles/manifests for JavaScript/TypeScript (package-lock, pnpm, yarn, bun, node_modules), Python (poetry/uv/pdm/pylock/Pipfile.lock, requirements, pyproject), Go (go.mod + toolchain stdlib), Rust, PHP, Ruby, Java/Kotlin (pom.xml with parent POM/BOM resolution, Gradle incl. version catalogs and Spring Boot BOM, gradle.lockfile; transitive deps resolved via Maven Central), C#/.NET (packages.lock.json, obj/project.assets.json, csproj + Directory.Packages.props, packages.config), Dart/Flutter, Elixir, Swift and R, and checks every dependency version against OSV.dev (GitHub Advisory DB, PyPA, Go, RustSec, malicious packages) and NVD, enriched with CISA KEV and EPSS. Returns a prioritized action plan (target version verified clean, latest version, deprecation/maintenance status, upgrade commands) plus detailed findings with code-fix guidance.",
     inputSchema: {
       path: z.string().describe("Project root directory or a manifest/lockfile path"),
       recursive: z.boolean().default(false).describe("Also scan sub-directories (monorepos), up to depth 4; skips node_modules, vendor, build output, virtualenvs"),
       include_dev: z.boolean().default(false).describe("Include dev/test dependencies"),
-      include_transitive: z.boolean().default(true).describe("Include transitive deps from lockfiles"),
+      include_transitive: z.boolean().default(true).describe("Include transitive deps (from lockfiles; for Maven/Gradle resolved via Maven Central POMs)"),
       sources: SOURCES,
       max_packages: z.number().int().min(1).max(2000).optional().describe("Max packages for the slow NVD cross-check in this call (default 10 without NVD_API_KEY, 60 with). OSV always checks all packages."),
       offset: z.number().int().min(0).default(0).describe("Continue the NVD cross-check from this package index (OSV results are reported in the offset=0 call)"),
@@ -116,11 +117,12 @@ server.registerTool(
     try {
       const target = resolve(args.path);
       const progress = progressFn(extra);
-      let { deps, manifests } = await collectDependencies(target, { includeDev: args.include_dev, recursive: args.recursive });
+      await progress("reading manifests / resolving Maven & Gradle graphs");
+      let { deps, manifests, notes } = await collectDependencies(target, { includeDev: args.include_dev, recursive: args.recursive, transitive: args.include_transitive });
       if (!args.include_transitive) deps = deps.filter((d) => d.direct !== false);
       deps.sort((a, b) => (a.direct === false) - (b.direct === false) || a.name.localeCompare(b.name));
       if (!deps.length)
-        return text(`No dependencies with resolvable versions found in ${target}.${manifests.length ? ` Manifests seen: ${manifests.join(", ")}` : ""}\nSupported: package-lock.json, yarn.lock, pnpm-lock.yaml, package.json, poetry.lock, uv.lock, Pipfile.lock, requirements*.txt, go.mod, Cargo.lock, composer.lock, Gemfile.lock, pom.xml, gradle.lockfile, build.gradle(.kts), packages.lock.json, *.csproj. Try recursive=true for monorepos.`);
+        return text(`No dependencies with resolvable versions found in ${target}.${manifests.length ? ` Manifests seen: ${manifests.join(", ")}` : ""}\nSupported: package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock, package.json(+node_modules), poetry.lock, uv.lock, pdm.lock, pylock.toml, Pipfile.lock, requirements*.txt, pyproject.toml, go.mod, Cargo.lock/Cargo.toml, composer.lock/composer.json, Gemfile.lock/Gemfile, pom.xml, build.gradle(.kts), gradle/libs.versions.toml, gradle.lockfile, packages.lock.json, obj/project.assets.json, *.csproj, Directory.Packages.props, packages.config, pubspec.lock, mix.lock, Package.resolved, renv.lock. Try recursive=true for monorepos.${notes?.length ? `\nNotes: ${notes.join("; ")}` : ""}`);
 
       const useOsv = args.sources !== "nvd" && args.offset === 0;
       const useNvd = args.sources === "nvd" || args.sources === "both" || (args.sources === "auto" && hasApiKey());
@@ -139,12 +141,18 @@ server.registerTool(
         nvd: useNvd ? `packages ${args.offset + 1}–${args.offset + nvdDeps.length} of ${deps.length}` : "skipped (set NVD_API_KEY or sources='both' to cross-check NVD CPE data)",
       };
       if (args.format === "json") {
-        return text(JSON.stringify({ path: target, manifests, ecosystems, totalDependencies: deps.length, coverage, nextOffset, actionPlan: plan, packageHealth: health, findings, errors }, null, 2));
+        return text(JSON.stringify({ path: target, manifests, notes, ecosystems, totalDependencies: deps.length, coverage, nextOffset, actionPlan: plan, packageHealth: health, findings, errors }, null, 2));
       }
       const head = [
         `# Dependency vulnerability scan: ${target}`,
         `Manifests: ${manifests.join(", ")}`,
         `Ecosystems: ${ecosystems.map((e) => ECOSYSTEMS[e]?.label || e).join(", ")} · Dependencies: ${deps.length} (direct ${deps.filter((d) => d.direct !== false).length})`,
+        (() => {
+          const c = (s) => deps.filter((d) => d.versionSource === s).length;
+          const est = c("range");
+          return `Version sources: lockfile ${c("lockfile")}, installed ${c("installed")}, exact pin ${c("manifest")}, resolved graph ${c("resolved")}, estimated from range ${est}${est ? " ⚠️ (estimated versions can cause false positives — add a lockfile)" : ""}`;
+        })(),
+        notes.length ? `Notes:\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
         `Coverage: OSV ${coverage.osv} · NVD ${coverage.nvd}`,
         summaryLine(findings, plan),
         nextOffset != null ? `\n⚠️ NVD cross-check not finished → call again with offset=${nextOffset}.` : "",
@@ -208,7 +216,7 @@ server.registerTool(
         if (reg.currentYanked) info.push(`⚠️ this version was yanked (${reg.currentYanked})`);
         if (reg.stale) info.push(`⚠️ ${reg.stale}`);
         L.push(`Registry: ${info.join(" · ")}${reg.url ? ` · ${reg.url}` : ""}`);
-      } else if (eco) {
+      } else if (eco && !(eco === "go" && args.name === "stdlib") && eco !== "swift") {
         L.push(`Registry: package not found in the ${eco} registry — check the name (typosquatting risk if you expected it to exist).`);
       }
       L.push(findings.length ? summaryLine(findings, plan) : "✅ No known vulnerabilities for this version.");

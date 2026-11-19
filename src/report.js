@@ -59,7 +59,19 @@ function upgradeFor(pkg, version) {
 }
 
 const pkgInfo = (pkg) =>
-  pkg ? { name: pkg.name, version: pkg.version, ecosystem: pkg.ecosystem, direct: pkg.direct ?? null, confidence: pkg.confidence || "high", source: pkg.source } : null;
+  pkg
+    ? { name: pkg.name, version: pkg.version, ecosystem: pkg.ecosystem, direct: pkg.direct ?? null, confidence: pkg.confidence || "high", source: pkg.source, versionSource: pkg.versionSource, declared: pkg.declared }
+    : null;
+
+/** Human hint about how reliable the package version is. */
+export function versionNote(p) {
+  if (!p) return null;
+  if (p.versionSource === "range")
+    return `⚠️ Version estimated from the declared range \`${p.declared ?? p.version}\` (no lockfile / installed packages found) — if a newer version is actually installed this may be a false positive. Add a lockfile for exact results.`;
+  if (p.versionSource === "resolved")
+    return `ℹ️ Version computed by resolving the Maven/Gradle graph (parent POM / BOM / transitive) — verify with \`mvn dependency:tree\` or \`gradle dependencies\` if in doubt.`;
+  return null;
+}
 
 /**
  * Build a normalised, agent-friendly finding from an NVD CVE (+ optional KEV entry + package context).
@@ -169,7 +181,7 @@ export function osvFix(records, dep) {
   };
 }
 
-function osvSeverity(records) {
+export function osvSeverity(records) {
   for (const r of records) {
     const v3 = (r.severity || []).find((s) => s.type === "CVSS_V3");
     if (v3) {
@@ -298,6 +310,8 @@ export function findingToMarkdown(f, { verbose = true } = {}) {
   if (f.aliases?.length) L.push(`- Also known as: ${f.aliases.join(", ")}`);
   L.push(`- Published: ${f.published} · Modified: ${f.lastModified} · Status: ${f.status} · Sources: ${f.sources.join(" + ")}`);
   if (f.package?.source) L.push(`- Found in: ${f.package.source}`);
+  const vn = versionNote(f.package);
+  if (vn) L.push(`- ${vn}`);
   if (f.package?.confidence && f.package.confidence !== "high") L.push(`- Match confidence: ${f.package.confidence} (NVD CPE name match, platform not specific to ${f.package.ecosystem} — verify it is the same project)`);
   if (f.malicious) {
     L.push(`- 🚨 This package version is flagged as MALICIOUS. Remove it immediately, check whether install scripts ran (CI and dev machines), and rotate any credentials/tokens available in those environments.`);

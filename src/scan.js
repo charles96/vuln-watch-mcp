@@ -1,9 +1,9 @@
 import { loadKev } from "./kev.js";
 import { nvdQueryAll, affectedRanges, severityRank, compareVersions } from "./nvd.js";
-import { osvQueryDeps, dedupeOsv, mapLimit } from "./osv.js";
+import { osvQueryDeps, dedupeOsv, mapLimit, getOsvVuln } from "./osv.js";
 import { getEpss } from "./epss.js";
 import { getRegistryInfo, nearestPublished } from "./registry.js";
-import { buildFinding, buildOsvFinding, mergeFindings, attachEpss, sortFindings, osvFix, findingToMarkdown } from "./report.js";
+import { buildFinding, buildOsvFinding, mergeFindings, attachEpss, sortFindings, osvFix, findingToMarkdown, osvSeverity } from "./report.js";
 import { cpeProductCandidates } from "./deps.js";
 import { ECOSYSTEMS, targetSwRelevance } from "./ecosystems.js";
 
@@ -68,6 +68,24 @@ export async function analyzeDependencies(deps, { useOsv = true, nvdDeps = [], v
   }
 
   let findings = [...perDep.values()].flat();
+  // advisories without CVSS (e.g. Go vulndb, some RustSec) → borrow the score from the CVE record
+  const unscored = [...new Set(findings.filter((f) => f.score == null && !f.malicious && /^CVE-/.test(f.id)).map((f) => f.id))];
+  const scores = new Map();
+  await mapLimit(unscored, 8, async (id) => {
+    try {
+      const rec = await getOsvVuln(id);
+      if (rec) {
+        const sev = osvSeverity([rec]);
+        if (sev.score != null || sev.severity !== "UNSCORED") scores.set(id, sev);
+      }
+    } catch {
+      /* optional */
+    }
+  });
+  for (const f of findings) {
+    const sev = f.score == null && scores.get(f.id);
+    if (sev) Object.assign(f, { score: sev.score, severity: sev.severity, cvss: f.cvss || sev.cvss });
+  }
   attachEpss(findings, await getEpss(findings.map((f) => f.id)));
   if (minSeverity) {
     const r = severityRank(minSeverity);
@@ -82,7 +100,7 @@ export function actionPlan(findings) {
   for (const f of findings) {
     if (!f.package) continue;
     const key = depKey(f.package);
-    const p = plan.get(key) || { ...f.package, cves: [], kev: false, malicious: false, maxEpss: 0, worst: "NONE", target: null, unfixed: [] };
+    const p = plan.get(key) || { ...f.package, cves: [], kev: false, malicious: false, maxEpss: 0, worst: "UNSCORED", target: null, unfixed: [] };
     p.cves.push(f.id);
     p.kev ||= Boolean(f.kev);
     p.malicious ||= f.malicious;
@@ -169,7 +187,8 @@ export function planToMarkdown(plan) {
     const eco = ECOSYSTEMS[p.ecosystem];
     const flags = [p.malicious && "🚨MALICIOUS", p.kev && "🔥KEV", p.maxEpss >= 0.1 && `⚠️EPSS ${(p.maxEpss * 100).toFixed(0)}%`].filter(Boolean).join(" ");
     const ids = p.cves.length > 10 ? `${p.cves.slice(0, 10).join(", ")} …+${p.cves.length - 10} more` : p.cves.join(", ");
-    L.push(`${i + 1}. **${p.name}@${p.version}** [${p.ecosystem}]${p.direct === false ? " (transitive)" : ""} — ${p.worst}${flags ? ` ${flags}` : ""}, ${p.cves.length} issue(s): ${ids}${p.source ? ` · in ${p.source}` : ""}`);
+    const est = p.versionSource === "range" ? ` (version estimated from \`${p.declared ?? p.version}\`)` : "";
+    L.push(`${i + 1}. **${p.name}@${p.version}**${est} [${p.ecosystem}]${p.direct === false ? " (transitive)" : ""} — ${p.worst}${flags ? ` ${flags}` : ""}, ${p.cves.length} issue(s): ${ids}${p.source ? ` · in ${p.source}` : ""}`);
     if (p.malicious) {
       L.push(`   - 🚨 REMOVE this package now (do not upgrade). Audit CI/dev machines where it was installed and rotate exposed secrets.`);
       return;

@@ -13,6 +13,10 @@ export const OSV_ECOSYSTEM = {
   rubygems: "RubyGems",
   cargo: "crates.io",
   nuget: "NuGet",
+  pub: "Pub",
+  hex: "Hex",
+  swift: "SwiftURL",
+  cran: "CRAN",
 };
 
 async function post(path, body) {
