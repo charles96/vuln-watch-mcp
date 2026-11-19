@@ -96,17 +96,148 @@ tool_timeout_sec = 600   # 의존성 스캔은 오래 걸릴 수 있습니다 (�
 
 ## 도구
 
-| 도구 | 설명 |
-|---|---|
-| `scan_project_dependencies` | `package-lock.json`/`package.json`, `requirements*.txt`, `go.mod`를 읽어 모든 의존성 버전을 점검합니다. 직접 의존성을 먼저 보고, 남은 패키지는 `offset`으로 이어서 스캔합니다. |
-| `check_package` | 패키지나 제품 하나의 버전을 점검합니다 (`lodash 4.17.15`, `django 3.2.0`, `nginx 1.18.0` 등). |
-| `latest_ecosystem_vulnerabilities` | 언어/생태계별 최신 CVE를 최신순으로 보여 줍니다 (npm, python, go, java, php, ruby, rust, dotnet). |
-| `search_vulnerabilities` | NVD 키워드 검색입니다. 최신순이며 `ecosystem`, `cwe`, `days`, `kev_only`로 거를 수 있습니다. |
-| `get_vulnerability` | CVE 하나의 전체 정보를 보여 줍니다. `installed_version`을 주면 그 버전 기준 수정 버전을 계산합니다. |
-| `check_kev` | 여러 CVE ID가 KEV에 있는지 한 번에 확인합니다 (로컬 조회라 빠름). |
-| `search_kev` | KEV를 벤더, 제품, 키워드, 최근 추가 기간, 랜섬웨어 악용 여부로 검색합니다. |
+| 분류 | 도구 | 한 줄 설명 |
+|---|---|---|
+| 내 프로젝트 점검 | [`scan_project_dependencies`](#scan_project_dependencies) | 프로젝트 의존성 전체 스캔 + 조치 계획 |
+| | [`check_package`](#check_package) | 패키지/제품 하나의 특정 버전 점검 |
+| 최신 취약점 파악 | [`latest_ecosystem_vulnerabilities`](#latest_ecosystem_vulnerabilities) | 언어/생태계별 최신 CVE |
+| | [`search_vulnerabilities`](#search_vulnerabilities) | NVD 키워드 검색 |
+| 특정 CVE 조사 | [`get_vulnerability`](#get_vulnerability) | CVE 하나의 전체 정보와 수정 버전 |
+| 실제 악용 여부 | [`check_kev`](#check_kev) | CVE 목록의 KEV 등재 여부 확인 |
+| | [`search_kev`](#search_kev) | KEV 카탈로그 검색 |
 
-모든 도구는 `format: "json"`으로 구조화된 결과를 받을 수 있습니다.
+공통 사항:
+- **결과 정렬:** 🔥 KEV(실제 악용) → CRITICAL/HIGH → 최신순
+- **심각도 값:** `min_severity`에는 `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`을 넣습니다.
+- **생태계 값:** `ecosystem`에는 `npm`(`javascript`, `typescript`, `node`), `pypi`(`python`), `go`, `maven`(`java`), `composer`(`php`), `rubygems`(`ruby`), `cargo`(`rust`), `nuget`(`dotnet`)을 쓸 수 있습니다. 괄호 안은 같은 뜻으로 받는 별칭입니다.
+- **결과 형식:** `check_kev`를 뺀 모든 도구는 `format: "json"`으로 구조화된 결과를 받을 수 있습니다 (기본값 `markdown`).
+
+### `scan_project_dependencies`
+
+프로젝트 폴더의 의존성 파일을 읽어, 설치된 버전마다 알려진 취약점이 있는지 NVD와 KEV로 확인합니다. 결과 맨 위에 패키지별 **조치 계획**(목표 버전, 실행할 명령, 메이저 업그레이드 경고)이 나오고, 그 아래 CVE별 상세가 이어집니다.
+
+- **읽는 파일:** `package-lock.json`(v1~v3, 없으면 `package.json`), `requirements*.txt`, `go.mod`
+- **스캔 순서:** 직접 의존성을 먼저 보고 간접 의존성을 봅니다. 한 번에 다 못 보면 `offset=N으로 이어서 호출하라`는 안내가 나옵니다.
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `path` | ✅ | | 프로젝트 루트 폴더 또는 의존성 파일 경로 |
+| `include_dev` | | `false` | devDependencies 포함 |
+| `include_transitive` | | `true` | lockfile의 간접 의존성 포함 |
+| `max_packages` | | 키 없음 10 / 키 있음 60 | 이번 호출에서 점검할 패키지 수 (1~500) |
+| `offset` | | `0` | 앞의 N개를 건너뜀 (이전 스캔 이어서 하기) |
+| `min_severity` | | | 이 심각도 이상만 표시 |
+
+```json
+{ "path": "/home/me/my-app", "include_dev": true, "min_severity": "HIGH" }
+```
+
+### `check_package`
+
+라이브러리나 제품 하나의 특정 버전에 영향을 주는 CVE를 모두 찾습니다. 새 패키지를 추가하거나 버전을 올리기 전에 쓰면 좋습니다. 결과 형식은 `scan_project_dependencies`와 같습니다(조치 계획 + CVE 상세).
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `name` | ✅ | | 패키지/제품 이름. 예: `lodash`, `@babel/traverse`, `django`, `github.com/gin-gonic/gin`, `nginx` |
+| `version` | ✅ | | 설치된 버전. 예: `4.17.15` |
+| `ecosystem` | | | 생태계. 지정하면 다른 플랫폼 CVE를 걸러내고 업그레이드 명령을 만들어 줍니다. |
+| `vendor` | | | CPE 벤더 이름으로 결과를 좁힘. 예: `djangoproject`, `f5`, `openssl` |
+| `min_severity` | | | 이 심각도 이상만 표시 |
+
+```json
+{ "name": "lodash", "version": "4.17.15", "ecosystem": "npm" }
+```
+
+### `latest_ecosystem_vulnerabilities`
+
+특정 언어/생태계에서 최근 공개된 CVE를 최신순으로 보여 줍니다. NVD의 플랫폼 정보(CPE)로 찾은 결과에 키워드 검색 결과를 합쳐서, NVD가 아직 분석하지 않은 신규 CVE도 포함합니다.
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `ecosystem` | ✅ | | 생태계 |
+| `days` | | `30` | 최근 N일 (1~120, NVD 제한) |
+| `keyword` | | | 추가로 좁힐 키워드. 예: `express`, `deserialization` |
+| `min_severity` | | | 이 심각도 이상만 표시 |
+| `kev_only` | | `false` | KEV에 등재된 것만 |
+| `limit` | | `20` | 최대 결과 수 (1~100) |
+
+```json
+{ "ecosystem": "python", "days": 14, "min_severity": "HIGH" }
+```
+
+### `search_vulnerabilities`
+
+NVD CVE 설명문을 키워드로 검색합니다 (최신순, 여러 단어는 모두 포함된 것만). 라이브러리, 프레임워크, 취약점 유형으로 찾을 때 씁니다.
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `keyword` | ✅ | | 검색어. 예: `next.js middleware`, `prototype pollution`, `log4j` |
+| `ecosystem` | | | 다른 플랫폼 대상 CVE 제외 |
+| `days` | | | 최근 N일 안에 공개된 것만 (1~120) |
+| `cwe` | | | CWE로 거르기. 예: `CWE-79` |
+| `min_severity` | | | 이 심각도 이상만 표시 |
+| `kev_only` | | `false` | KEV에 등재된 것만 |
+| `exact_match` | | `false` | 검색어를 정확한 구문으로 취급 |
+| `limit` | | `15` | 최대 결과 수 (1~100) |
+
+```json
+{ "keyword": "next.js", "ecosystem": "npm", "days": 60 }
+```
+
+### `get_vulnerability`
+
+CVE 하나의 전체 정보를 보여 줍니다. 로그, `npm audit` 결과, 보안 공지에 CVE 번호가 나왔을 때 씁니다. `installed_version`을 주면 **그 버전 기준으로 어느 버전으로 올려야 하는지** 계산합니다.
+
+- **결과:** 설명, CVSS 점수와 벡터, CWE와 코드 수정 가이드, 영향받는 버전 범위(요청한 제품 우선, 최대 25개), KEV 정보, 패치/권고 링크(최대 30개)
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `cve_id` | ✅ | | CVE ID. 예: `CVE-2021-44228` |
+| `installed_version` | | | 사용 중인 버전 (수정 버전 계산용) |
+| `product` | | | CVE에 여러 제품이 걸려 있을 때 내가 쓰는 제품의 CPE 이름. 예: `log4j` |
+| `ecosystem` | | | 업그레이드 명령 생성용 생태계 |
+
+```json
+{ "cve_id": "CVE-2021-44228", "installed_version": "2.14.1", "product": "log4j" }
+```
+
+### `check_kev`
+
+CVE 목록이 CISA KEV(실제로 악용되고 있는 취약점 목록)에 있는지 한 번에 확인합니다. 내려받아 둔 카탈로그에서 조회하므로 빠릅니다. 등재된 CVE는 조치 기한, 랜섬웨어 악용 여부, CISA 필수 조치를 함께 보여 줍니다.
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `cve_ids` | ✅ | | CVE ID 배열 (1~500개) |
+
+```json
+{ "cve_ids": ["CVE-2021-44228", "CVE-2020-8203"] }
+```
+
+### `search_kev`
+
+KEV 카탈로그를 직접 검색합니다 (최근 추가순). "최근 한 달간 새로 악용되기 시작한 취약점" 같은 질문에 씁니다.
+
+| 파라미터 | 필수 | 기본값 | 설명 |
+|---|---|---|---|
+| `query` | | | 검색어 (CVE ID, 벤더, 제품, 이름, 설명에서 모든 단어 포함) |
+| `vendor` | | | 벤더 이름 일부. 예: `microsoft` |
+| `product` | | | 제품 이름 일부. 예: `exchange` |
+| `days` | | | 최근 N일 안에 KEV에 추가된 것만 |
+| `ransomware_only` | | `false` | 랜섬웨어 악용이 확인된 것만 |
+| `limit` | | `25` | 최대 결과 수 (1~200) |
+
+```json
+{ "days": 30, "ransomware_only": true }
+```
+
+### 프롬프트: `security_audit`
+
+도구를 하나씩 부르는 대신 **점검부터 수정까지 한 번에** 진행하도록 에이전트에게 주는 작업 지시입니다. `path`(선택, 기본값은 현재 폴더)를 받습니다.
+
+1. `scan_project_dependencies`로 의존성 전체 스캔 (남은 패키지가 없을 때까지 `offset`으로 반복)
+2. 감지된 생태계마다 `latest_ecosystem_vulnerabilities`로 최근 30일 취약점 확인
+3. KEV → CRITICAL → HIGH 순으로 수정: 의존성 파일과 lockfile 업데이트(간접 의존성은 overrides/resolutions), 코드에서 취약한 기능을 쓰는 곳을 찾아 CWE 가이드대로 수정
+4. 다시 스캔해서 확인하고, 고친 것·남은 것(수정 버전 없음)·권장 완화 조치를 요약
 
 ## 결과에 포함되는 정보
 
